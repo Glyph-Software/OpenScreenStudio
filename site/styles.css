@@ -10,9 +10,13 @@
   --ink-soft:rgba(244,241,234,.62);
   --ink-faint:rgba(244,241,234,.34);
   --line:rgba(244,241,234,.10);
-  --amber:#ff8a3d;          /* tungsten key light */
+  --amber:#ff8a3d;          /* warm accent pop */
   --amber-soft:#ffb277;
   --violet:#8b7bff;         /* the app's zoom-block accent, cooled */
+  /* brand — sampled from the logo ring (green → teal → cyan) */
+  --brand-green:#4cd07d;
+  --brand-teal:#1fbfae;
+  --brand-cyan:#14b8d6;
   --r:18px;
   --maxw:1180px;
   --font-d:"Bricolage Grotesque",-apple-system,system-ui,sans-serif;
@@ -42,9 +46,9 @@ a{color:inherit;text-decoration:none}
 .spotlight{
   position:fixed;inset:0;z-index:0;pointer-events:none;
   background:
-    radial-gradient(900px 600px at 78% -8%, rgba(255,138,61,.22), transparent 60%),
-    radial-gradient(820px 620px at 8% 12%, rgba(139,123,255,.14), transparent 58%),
-    radial-gradient(1200px 900px at 50% 120%, rgba(255,138,61,.10), transparent 60%);
+    radial-gradient(900px 600px at 78% -8%, rgba(76,208,125,.22), transparent 60%),
+    radial-gradient(820px 620px at 8% 12%, rgba(31,191,174,.16), transparent 58%),
+    radial-gradient(1200px 900px at 50% 120%, rgba(20,184,214,.11), transparent 60%);
 }
 
 /* ---- nav ---- */
@@ -132,7 +136,7 @@ section{padding:clamp(80px,12vw,150px) clamp(20px,5vw,56px);max-width:var(--maxw
 }
 .frame-glow{
   position:absolute;inset:-30% -10% -20%;z-index:-1;
-  background:radial-gradient(60% 60% at 60% 40%,rgba(255,138,61,.4),transparent 70%);
+  background:radial-gradient(60% 60% at 60% 40%,rgba(31,191,174,.42),transparent 70%);
   filter:blur(60px);
 }
 
@@ -182,7 +186,7 @@ section{padding:clamp(80px,12vw,150px) clamp(20px,5vw,56px);max-width:var(--maxw
 /* ---- open source ---- */
 .open{max-width:var(--maxw)}
 .open-inner{
-  background:linear-gradient(155deg,rgba(255,138,61,.10),rgba(139,123,255,.07));
+  background:linear-gradient(155deg,rgba(76,208,125,.12),rgba(20,184,214,.07));
   border:1px solid var(--line);border-radius:32px;
   padding:clamp(40px,6vw,80px);text-align:center;
 }
