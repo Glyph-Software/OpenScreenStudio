@@ -1,7 +1,7 @@
 {
   "name": "openscreen-studio",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.2",
   "type": "module",
   "scripts": {
     "clean": "rm -rf dist src-tauri/target",
