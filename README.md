@@ -3,6 +3,9 @@
 <img src="logo.png" alt="OpenScreen Studio" width="128" />
 
 # OpenScreen Studio
+<small>
+[Glyph Software LLP](https://glyphsoftware.org)
+</small>
 
 An open-source [Screen Studio](https://screen.studio) clone for macOS, built with Tauri 2 + React 19 + TypeScript.
 
