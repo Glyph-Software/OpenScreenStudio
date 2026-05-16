@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenScreen Studio — cinematic screen recordings, open source</title>
+<meta name="description" content="An open-source macOS screen recorder with a polished editor: auto-zoom-on-click, cursor overlay, and wallpaper backgrounds. In-process ScreenCaptureKit. A free Screen Studio alternative." />
+<meta name="theme-color" content="#08070a" />
+<meta property="og:title" content="OpenScreen Studio" />
+<meta property="og:description" content="Cinematic screen recordings on macOS. Open source. Auto-zoom, cursor overlay, wallpaper backgrounds." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="assets/logo.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Hanken+Grotesk:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+<div class="spotlight" aria-hidden="true"></div>
+
+<header class="nav" id="nav">
+  <a class="brand" href="#top">
+    <img src="assets/logo.png" alt="" width="30" height="30" />
+    <span>OpenScreen&nbsp;Studio</span>
+  </a>
+  <nav class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#capture">How it works</a>
+    <a href="#open">Open source</a>
+    <a class="ghost-btn" href="https://github.com/Glyph-Software/OpenScreenStudio" target="_blank" rel="noopener">GitHub ↗</a>
+  </nav>
+</header>
+
+<main id="top">
+
+  <section class="hero">
+    <div class="hero-copy reveal">
+      <span class="eyebrow">Open-source · macOS · ScreenCaptureKit</span>
+      <h1>
+        Screen recordings,<br />
+        <span class="serif">made&nbsp;cinematic.</span>
+      </h1>
+      <p class="lede">
+        A free, open-source <a href="https://screen.studio" target="_blank" rel="noopener">Screen&nbsp;Studio</a>
+        alternative for macOS. Record in-process with ScreenCaptureKit, then let the editor
+        auto-zoom on every click, smooth the cursor, and drop your capture onto a gorgeous wallpaper.
+      </p>
+      <div class="cta-row">
+        <a class="solid-btn" href="https://github.com/Glyph-Software/OpenScreenStudio" target="_blank" rel="noopener">
+          Get it on GitHub
+        </a>
+        <a class="text-btn" href="#capture">See how capture works →</a>
+      </div>
+      <div class="stat-strip">
+        <div><b>0</b><span>ffmpeg in the record path</span></div>
+        <div><b>30fps</b><span>in-process SCK capture</span></div>
+        <div><b>1-click</b><span>auto-zoom from cursor track</span></div>
+      </div>
+    </div>
+
+    <figure class="hero-stage reveal" style="--d:.15s">
+      <div class="screen-frame">
+        <video src="assets/sample.mp4" autoplay muted loop playsinline poster="assets/editor.png"></video>
+        <div class="zoom-tag">● AUTO-ZOOM ON CLICK</div>
+      </div>
+      <div class="frame-glow" aria-hidden="true"></div>
+    </figure>
+  </section>
+
+  <section class="marquee" aria-hidden="true">
+    <div class="marquee-track">
+      <span>Auto-zoom</span><i>✦</i><span>Cursor overlay</span><i>✦</i><span>Wallpaper backgrounds</span><i>✦</i><span>Pause / resume / restart</span><i>✦</i><span>Project save &amp; open</span><i>✦</i><span>Display · window · area</span><i>✦</i>
+      <span>Auto-zoom</span><i>✦</i><span>Cursor overlay</span><i>✦</i><span>Wallpaper backgrounds</span><i>✦</i><span>Pause / resume / restart</span><i>✦</i><span>Project save &amp; open</span><i>✦</i><span>Display · window · area</span><i>✦</i>
+    </div>
+  </section>
+
+  <section class="features" id="features">
+    <header class="sec-head reveal">
+      <span class="eyebrow">What's inside</span>
+      <h2>Every detail tuned for <span class="serif">beautiful</span> demos.</h2>
+    </header>
+    <div class="grid">
+      <article class="card big reveal">
+        <div class="card-art editor-shot">
+          <img src="assets/editor.png" alt="The OpenScreen Studio editor: viewport, inspector, timeline with zoom blocks" />
+        </div>
+        <div class="card-body">
+          <h3>A real editor, not a trimmer</h3>
+          <p>Viewport, inspector, and a timeline with draggable zoom blocks. Swap the background to a macOS wallpaper, a gradient, or a solid — tune padding and shape live.</p>
+        </div>
+      </article>
+
+      <article class="card reveal" style="--d:.05s">
+        <div class="card-icon">⌖</div>
+        <h3>Auto-zoom on click</h3>
+        <p>A cursor sidecar records every click while you record. The editor derives smooth zoom segments from it — punch-in where it matters, automatically.</p>
+      </article>
+
+      <article class="card reveal" style="--d:.1s">
+        <div class="card-icon">⇲</div>
+        <h3>Cursor overlay</h3>
+        <p>Cursor position, clicks, and shape transitions are tracked at ~poll rate and replayed as a clean, oversized overlay on top of your footage.</p>
+      </article>
+
+      <article class="card reveal" style="--d:.15s">
+        <div class="card-icon">◳</div>
+        <h3>Display, window, or area</h3>
+        <p>Per-display transparent picker overlays let you grab a whole screen, a single window, or drag out an exact region before the 3-2-1 countdown.</p>
+      </article>
+
+      <article class="card reveal" style="--d:.2s">
+        <div class="card-icon">◆</div>
+        <h3>In-process, no sidecar</h3>
+        <p>Recording is a native <code>SCStream</code> writing mp4 directly via ScreenCaptureKit. No ffmpeg in the capture path, no AVFoundation device juggling.</p>
+      </article>
+
+      <article class="card reveal" style="--d:.25s">
+        <div class="card-icon">⌘</div>
+        <h3>Pause, resume, restart</h3>
+        <p>Full transport control from a frameless always-on-top pill — or stop from the macOS menu bar and the app finalizes the same artifact.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="capture" id="capture">
+    <header class="sec-head reveal">
+      <span class="eyebrow">Under the hood</span>
+      <h2>From key-press to <span class="serif">graded</span> clip.</h2>
+    </header>
+    <ol class="steps">
+      <li class="reveal"><b>01</b><h4>Pick a source</h4><p>Transparent overlays span every display. Choose a screen, window, or dragged area.</p></li>
+      <li class="reveal" style="--d:.08s"><b>02</b><h4>Record in-process</h4><p>ScreenCaptureKit streams straight to mp4 at 30fps while a cursor track polls clicks and shapes.</p></li>
+      <li class="reveal" style="--d:.16s"><b>03</b><h4>Hand off the artifact</h4><p>On stop, an mp4 plus a <code>.cursor.json</code> sidecar land in <code>~/Movies/OpenScreen&nbsp;Studio</code>.</p></li>
+      <li class="reveal" style="--d:.24s"><b>04</b><h4>Edit &amp; beautify</h4><p>The editor reads the sidecar, derives auto-zoom, paints the cursor overlay, and frames it on a wallpaper.</p></li>
+    </ol>
+  </section>
+
+  <section class="open" id="open">
+    <div class="open-inner reveal">
+      <span class="eyebrow">Free &amp; open</span>
+      <h2>Built with Tauri&nbsp;2, React&nbsp;19 &amp; Rust.</h2>
+      <p>No telemetry, no account, no paywall. Clone it, build it with Bun, ship your own. macOS&nbsp;13+ (recording path needs macOS&nbsp;15+).</p>
+      <div class="code-card">
+        <div class="code-dots"><i></i><i></i><i></i></div>
+<pre><code><span class="c">// install deps + fetch bundled ffmpeg</span>
+bun install
+<span class="c">// run the desktop app (frontend + Rust)</span>
+bun run tauri dev</code></pre>
+      </div>
+      <div class="cta-row">
+        <a class="solid-btn" href="https://github.com/Glyph-Software/OpenScreenStudio" target="_blank" rel="noopener">Star on GitHub</a>
+        <a class="text-btn" href="https://github.com/Glyph-Software/OpenScreenStudio/blob/main/README.md" target="_blank" rel="noopener">Read the docs →</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="foot-brand">
+    <img src="assets/logo.png" alt="" width="26" height="26" />
+    <span>OpenScreen Studio</span>
+  </div>
+  <p>
+    Built &amp; maintained by
+    <a href="https://glyphsoftware.org" target="_blank" rel="noopener">Glyph Software LLP</a>
+    — crafting scalable solutions for modern needs. Bengaluru, India.
+  </p>
+  <p class="legal">© <span id="year">2026</span> · Open source · A Screen Studio clone, with love.</p>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>
