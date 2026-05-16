@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Contributing guide
+    url: https://github.com/Glyph-Software/OpenScreenStudio/blob/main/CONTRIBUTION.md
+    about: Setup, conventions, and the verification checklist before opening a PR.
+  - name: Project contact
+    url: https://glyphsoftware.org
+    about: Questions for the maintainers — contact@glyphsoftware.org
