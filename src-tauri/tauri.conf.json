@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpenScreen Studio",
-  "version": "0.1.0",
-  "identifier": "com.openscreenstudio.app",
+  "version": "0.2.1",
+  "identifier": "org.glyphsoftware.oss",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
