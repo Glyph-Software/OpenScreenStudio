@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>OpenScreen Studio uses the camera so you can include yourself in screen recordings.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>OpenScreen Studio uses the microphone to record narration during screen captures.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>OpenScreen Studio captures your screen to create polished recordings.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>OpenScreen Studio uses Apple events to coordinate with other apps during capture.</string>
+</dict>
+</plist>

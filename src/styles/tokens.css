@@ -1,0 +1,248 @@
+/* macOS 26 — Tokens
+   Source: macOS 26 (Community).fig (Apple Design Resources)
+   Color values, type scale, materials, radii, shadows.
+*/
+
+/* SF Pro is a licensed Apple font. OTFs are served from public/fonts/; Inter is the web fallback. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap');
+
+/* ---- SF Pro @font-face ---- */
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Regular.otf") format("opentype"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-RegularItalic.otf") format("opentype"); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Medium.otf") format("opentype"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-MediumItalic.otf") format("opentype"); font-weight: 500; font-style: italic; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Semibold.otf") format("opentype"); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-SemiboldItalic.otf") format("opentype"); font-weight: 600; font-style: italic; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Bold.otf") format("opentype"); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-BoldItalic.otf") format("opentype"); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Heavy.otf") format("opentype"); font-weight: 800; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Black.otf") format("opentype"); font-weight: 900; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Light.otf") format("opentype"); font-weight: 300; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Thin.otf") format("opentype"); font-weight: 200; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Text"; src: url("/fonts/SF-Pro-Text-Ultralight.otf") format("opentype"); font-weight: 100; font-style: normal; font-display: swap; }
+
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Regular.otf") format("opentype"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Medium.otf") format("opentype"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Semibold.otf") format("opentype"); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Bold.otf") format("opentype"); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Heavy.otf") format("opentype"); font-weight: 800; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Black.otf") format("opentype"); font-weight: 900; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Light.otf") format("opentype"); font-weight: 300; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Thin.otf") format("opentype"); font-weight: 200; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Display"; src: url("/fonts/SF-Pro-Display-Ultralight.otf") format("opentype"); font-weight: 100; font-style: normal; font-display: swap; }
+
+@font-face { font-family: "SF Pro Rounded"; src: url("/fonts/SF-Pro-Rounded-Regular.otf") format("opentype"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Rounded"; src: url("/fonts/SF-Pro-Rounded-Medium.otf") format("opentype"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Rounded"; src: url("/fonts/SF-Pro-Rounded-Semibold.otf") format("opentype"); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Rounded"; src: url("/fonts/SF-Pro-Rounded-Bold.otf") format("opentype"); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Rounded"; src: url("/fonts/SF-Pro-Rounded-Heavy.otf") format("opentype"); font-weight: 800; font-style: normal; font-display: swap; }
+@font-face { font-family: "SF Pro Rounded"; src: url("/fonts/SF-Pro-Rounded-Black.otf") format("opentype"); font-weight: 900; font-style: normal; font-display: swap; }
+
+:root {
+  /* ---- Type families ---- */
+  --font-sans: "SF Pro Text", -apple-system, BlinkMacSystemFont,
+               "Inter", "Helvetica Neue", Arial, sans-serif;
+  --font-display: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont,
+                  "Inter", "Helvetica Neue", Arial, sans-serif;
+  --font-sans-rounded: "SF Pro Rounded", -apple-system-rounded, "SF Pro",
+                       "Inter", system-ui, sans-serif;
+  --font-mono: "SF Mono", "Menlo", "Consolas", monospace;
+
+  /* ---- Foreground / label colors (light) ----
+     Apple's five label opacities. These are *opacities on black*, applied
+     atop whatever material sits underneath. */
+  --label-primary:    rgba(0, 0, 0, 0.85);
+  --label-secondary:  rgba(0, 0, 0, 0.50);
+  --label-tertiary:   rgba(0, 0, 0, 0.25);
+  --label-quaternary: rgba(0, 0, 0, 0.10);
+  --label-quinary:    rgba(0, 0, 0, 0.05);
+
+  /* ---- Foreground / label colors (dark) ---- */
+  --label-primary-dark:    rgba(255, 255, 255, 0.85);
+  --label-secondary-dark:  rgba(255, 255, 255, 0.55);
+  --label-tertiary-dark:   rgba(255, 255, 255, 0.25);
+  --label-quaternary-dark: rgba(255, 255, 255, 0.10);
+  --label-quinary-dark:    rgba(255, 255, 255, 0.05);
+
+  /* ---- System accent palette — Solid (used over opaque surfaces) ---- */
+  --accent-red:    rgb(255, 56, 60);
+  --accent-orange: rgb(255, 149, 0);
+  --accent-yellow: rgb(255, 214, 0);
+  --accent-green:  rgb(52, 199, 89);
+  --accent-mint:   rgb(60, 225, 85);
+  --accent-teal:   rgb(48, 176, 199);
+  --accent-cyan:   rgb(0, 192, 232);
+  --accent-blue:   rgb(0, 122, 255);
+  --accent-indigo: rgb(88, 86, 214);
+  --accent-purple: rgb(175, 82, 222);
+  --accent-pink:   rgb(255, 45, 85);
+  --accent-brown:  rgb(172, 127, 94);
+  --accent-gray:   rgb(142, 142, 147);
+
+  /* ---- System accent palette — Vibrant (over translucent materials) ----
+     Slightly brighter so they read through Liquid Glass blur. */
+  --accent-red-vibrant:    rgb(255, 79, 68);
+  --accent-orange-vibrant: rgb(255, 169, 33);
+  --accent-yellow-vibrant: rgb(255, 224, 51);
+  --accent-green-vibrant:  rgb(60, 215, 100);
+  --accent-mint-vibrant:   rgb(75, 240, 100);
+  --accent-teal-vibrant:   rgb(68, 212, 237);
+  --accent-cyan-vibrant:   rgb(90, 205, 241);
+  --accent-blue-vibrant:   rgb(13, 111, 255);
+  --accent-indigo-vibrant: rgb(110, 108, 230);
+  --accent-purple-vibrant: rgb(200, 110, 240);
+  --accent-pink-vibrant:   rgb(255, 70, 110);
+  --accent-brown-vibrant:  rgb(182, 152, 114);
+  --accent-gray-vibrant:   rgb(160, 160, 165);
+
+  /* ---- Semantic ---- */
+  --color-accent: var(--accent-blue);
+  --color-destructive: var(--accent-red);
+  --color-link: var(--accent-blue);
+
+  /* Selection */
+  --selection-fill: rgb(0, 122, 255);
+  --selection-fill-inactive: rgb(217, 217, 217);
+  --selection-text: rgb(255, 255, 255);
+
+  /* ---- Surface fills ---- */
+  --surface-window:        rgb(245, 245, 245);
+  --surface-window-dark:   rgb(38, 38, 38);
+  --surface-content:       rgb(255, 255, 255);
+  --surface-content-dark:  rgb(26, 26, 26);
+  --surface-control:       rgb(255, 255, 255);
+  --surface-control-dark:  rgb(64, 64, 64);
+  --surface-sidebar:       rgba(245, 245, 245, 0.67);
+  --surface-sidebar-dark:  rgba(38, 38, 38, 0.67);
+
+  --separator:       rgba(0, 0, 0, 0.10);
+  --separator-dark:  rgba(255, 255, 255, 0.10);
+  --hairline:        rgba(0, 0, 0, 0.05);
+
+  /* ---- Liquid Glass material recipes ----
+     Use as background plus a backdrop-filter on the host element. */
+  --glass-light:
+    linear-gradient(rgba(255,255,255,0.03), rgba(255,255,255,0.03)),
+    linear-gradient(rgba(245,245,245,0.67), rgba(245,245,245,0.67));
+  --glass-light-tint: rgba(0,0,0,0.06);  /* refraction overlay */
+  --glass-dark:
+    linear-gradient(rgba(255,255,255,0.03), rgba(255,255,255,0.03)),
+    linear-gradient(rgba(38,38,38,0.67), rgba(38,38,38,0.67));
+  --glass-dark-tint: rgba(0,0,0,0.20);
+  --glass-blur: blur(40px) saturate(1.6);
+
+  /* ---- Radii ---- */
+  --radius-xs: 3px;   /* badges, tiny chips */
+  --radius-sm: 5px;   /* controls, table cells, hover rows */
+  --radius-md: 6px;   /* push buttons, segmented controls */
+  --radius-lg: 12px;  /* sheets, popovers */
+  --radius-xl: 16px;  /* windows */
+  --radius-2xl: 22px; /* large popovers, big alert chrome */
+  --radius-3xl: 34px; /* medium liquid glass */
+  --radius-4xl: 64px; /* large liquid glass, hero sheets */
+
+  /* ---- Spacing scale ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 14px;
+  --space-5: 20px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  /* ---- Shadows ---- */
+  --shadow-window: 0 16px 60px rgba(0,0,0,0.23), 0 0 0 0.5px rgba(0,0,0,0.4);
+  --shadow-sheet:  0 8px 40px rgba(0,0,0,0.12), 0 0 0 0.5px rgba(0,0,0,0.2);
+  --shadow-popover: 0 6px 24px rgba(0,0,0,0.15), 0 0 0 0.5px rgba(0,0,0,0.2);
+  --shadow-control: 0 0.5px 0 0 rgba(0,0,0,0.05), 0 1px 0 0 rgba(0,0,0,0.05);
+  --shadow-glass-inner: inset 0 1px 0 rgba(255,255,255,0.50),
+                       inset 0 -1px 0 rgba(0,0,0,0.05);
+
+  /* ---- Motion ---- */
+  --ease-default: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --ease-emphasized: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.5, 1.6, 0.4, 0.9);
+  --duration-hover: 150ms;
+  --duration-press: 200ms;
+  --duration-sheet: 250ms;
+
+  /* ---- Type scale ---- 
+     Apple sizes are pt; 1pt ≈ 1px in this kit. line-height in px. */
+  --type-large-title-size:  26px;
+  --type-large-title-line:  32px;
+  --type-large-title-weight: 400;
+
+  --type-title-1-size:  22px;
+  --type-title-1-line:  26px;
+  --type-title-1-weight: 400;
+
+  --type-title-2-size:  17px;
+  --type-title-2-line:  22px;
+  --type-title-2-weight: 400;
+
+  --type-title-3-size:  15px;
+  --type-title-3-line:  20px;
+  --type-title-3-weight: 400;
+
+  --type-headline-size:   13px;
+  --type-headline-line:   16px;
+  --type-headline-weight: 700;
+
+  --type-body-size:   13px;
+  --type-body-line:   16px;
+  --type-body-weight: 400;
+
+  --type-callout-size:   12px;
+  --type-callout-line:   15px;
+  --type-callout-weight: 400;
+
+  --type-subheadline-size:   11px;
+  --type-subheadline-line:   14px;
+  --type-subheadline-weight: 400;
+
+  --type-footnote-size:   10px;
+  --type-footnote-line:   13px;
+  --type-footnote-weight: 400;
+
+  --type-caption-1-size:   10px;
+  --type-caption-1-line:   13px;
+  --type-caption-1-weight: 500;
+
+  --type-caption-2-size:   10px;
+  --type-caption-2-line:   13px;
+  --type-caption-2-weight: 700;
+
+  /* The default UI metric: SF Pro Medium 13/16. */
+  --type-ui-size: 13px;
+  --type-ui-line: 16px;
+  --type-ui-weight: 500;
+}
+
+/* -----------------------------------------------------------
+   Semantic helpers — drop these classes onto elements.
+----------------------------------------------------------- */
+
+.macos-large-title { font: var(--type-large-title-weight) var(--type-large-title-size)/var(--type-large-title-line) var(--font-sans); letter-spacing: -0.02em; }
+.macos-title-1     { font: var(--type-title-1-weight) var(--type-title-1-size)/var(--type-title-1-line) var(--font-sans); letter-spacing: -0.01em; }
+.macos-title-2     { font: var(--type-title-2-weight) var(--type-title-2-size)/var(--type-title-2-line) var(--font-sans); }
+.macos-title-3     { font: var(--type-title-3-weight) var(--type-title-3-size)/var(--type-title-3-line) var(--font-sans); }
+.macos-headline    { font: var(--type-headline-weight) var(--type-headline-size)/var(--type-headline-line) var(--font-sans); }
+.macos-body        { font: var(--type-body-weight) var(--type-body-size)/var(--type-body-line) var(--font-sans); }
+.macos-callout     { font: var(--type-callout-weight) var(--type-callout-size)/var(--type-callout-line) var(--font-sans); }
+.macos-subheadline { font: var(--type-subheadline-weight) var(--type-subheadline-size)/var(--type-subheadline-line) var(--font-sans); }
+.macos-footnote    { font: var(--type-footnote-weight) var(--type-footnote-size)/var(--type-footnote-line) var(--font-sans); }
+.macos-caption-1   { font: var(--type-caption-1-weight) var(--type-caption-1-size)/var(--type-caption-1-line) var(--font-sans); }
+.macos-caption-2   { font: var(--type-caption-2-weight) var(--type-caption-2-size)/var(--type-caption-2-line) var(--font-sans); text-transform: uppercase; letter-spacing: 0.06em; }
+.macos-ui          { font: var(--type-ui-weight) var(--type-ui-size)/var(--type-ui-line) var(--font-sans); }
+
+/* Reset for cards */
+.macos-reset {
+  font-family: var(--font-sans);
+  font-size: var(--type-ui-size);
+  line-height: var(--type-ui-line);
+  color: var(--label-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
