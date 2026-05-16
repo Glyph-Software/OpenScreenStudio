@@ -13,11 +13,18 @@ import {
 import {
   DEFAULT_AUTO_ZOOM_OPTIONS,
   DEFAULT_SNAP_TO_EDGES,
-  activeSegmentAt,
   deriveAutoZoom,
-  resolveZoom,
   type ZoomSegment,
 } from "../../lib/autoZoom";
+import {
+  computeFrameLayout,
+  computeZoomTransform,
+  cursorPosAt,
+  cursorShapeAt,
+  glyphFor,
+  isWallpaperImage,
+} from "../../lib/compositor";
+import { ExportDialog } from "./ExportDialog";
 
 type ZoomSettings = {
   autoOn: boolean;
@@ -98,10 +105,6 @@ const GRADIENTS = [
   "wp-15", "wp-16", "wp-17",
 ];
 
-// A wallpaper value is either a CSS gradient class ("wp-7") or an absolute
-// path to a real macOS desktop picture.
-const isWallpaperImage = (wp: string) => wp.startsWith("/");
-
 /** Crop region, normalized 0..1 over the recorded video frame. */
 type CropRect = { x: number; y: number; w: number; h: number };
 
@@ -145,75 +148,6 @@ async function fetchSidecar(
   } catch {
     return null;
   }
-}
-
-/**
- * Interpolated cursor position (in sidecar reference coords) at `tMs`.
- * Linear-interpolates between the two bracketing samples so playback is
- * smooth instead of stair-stepping sample-to-sample. Clamps to the first/last
- * sample outside the captured range. Returns null when there are no samples.
- */
-function cursorPosAt(
-  sc: CursorSidecar,
-  tMs: number,
-): { x: number; y: number } | null {
-  const s = sc.samples;
-  if (s.length === 0) return null;
-  if (tMs <= s[0].tMs) return { x: s[0].x, y: s[0].y };
-  const last = s[s.length - 1];
-  if (tMs >= last.tMs) return { x: last.x, y: last.y };
-  let lo = 0;
-  let hi = s.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (s[mid].tMs <= tMs) lo = mid;
-    else hi = mid;
-  }
-  const a = s[lo];
-  const b = s[hi];
-  const span = b.tMs - a.tMs;
-  const f = span > 0 ? (tMs - a.tMs) / span : 0;
-  return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
-}
-
-/** Cursor shape in effect at `tMs` (last transition with tMs ≤ t). */
-function cursorShapeAt(sc: CursorSidecar, tMs: number): CursorSidecarShapeName {
-  const cs = sc.cursorShapes;
-  if (!cs || cs.length === 0) return "arrow";
-  if (tMs <= cs[0].tMs) return cs[0].shape;
-  let lo = 0;
-  let hi = cs.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (cs[mid].tMs <= tMs) lo = mid;
-    else hi = mid;
-  }
-  return cs[hi].tMs <= tMs ? cs[hi].shape : cs[lo].shape;
-}
-
-// Glyph art for the synthetic cursor. `hot` is the hotspot as a fraction of
-// the 24×24 viewBox so the active point lands exactly on the tracked position.
-// Shapes we don't have bespoke art for fall back to the arrow.
-type Glyph = { svg: string; hot: [number, number] };
-const ARROW_GLYPH: Glyph = {
-  svg: '<path d="M4 2 L4 18 L8 14 L11 20.5 L13.6 19.4 L10.6 13 L16 13 Z" fill="#000" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/>',
-  hot: [4 / 24, 2 / 24],
-};
-const CURSOR_GLYPHS: Partial<Record<CursorSidecarShapeName, Glyph>> = {
-  arrow: ARROW_GLYPH,
-  pointer: {
-    svg: '<path d="M10 9V4.2c0-0.9 0.7-1.6 1.6-1.6s1.6 0.7 1.6 1.6V9.4 M13.2 10V8.4c0-0.8 0.7-1.5 1.5-1.5s1.5 0.7 1.5 1.5V11 M16.2 11.2v-1c0-0.8 0.6-1.4 1.4-1.4s1.4 0.6 1.4 1.4V16c0 2.6-1.9 4.8-4.6 4.8h-2.1c-1.4 0-2.7-0.6-3.6-1.7l-3.1-3.8c-0.5-0.7-0.4-1.6 0.3-2.1 0.6-0.5 1.5-0.4 2.1 0.2L10 15V6.2c0-0.9 0.7-1.6 1.6-1.6" fill="#000" stroke="#fff" stroke-width="1.1" stroke-linejoin="round" stroke-linecap="round"/>',
-    hot: [11 / 24, 2.6 / 24],
-  },
-  text: {
-    svg: '<path d="M8.5 3.5h7M8.5 20.5h7M12 3.5v17" stroke="#fff" stroke-width="3.4" fill="none" stroke-linecap="round"/><path d="M8.5 3.5h7M8.5 20.5h7M12 3.5v17" stroke="#000" stroke-width="1.6" fill="none" stroke-linecap="round"/>',
-    hot: [0.5, 0.5],
-  },
-};
-CURSOR_GLYPHS.verticalText = CURSOR_GLYPHS.text;
-
-function glyphFor(shape: CursorSidecarShapeName): Glyph {
-  return CURSOR_GLYPHS[shape] ?? ARROW_GLYPH;
 }
 
 const baseName = (p: string) => p.split(/[\\/]/).pop() || p;
@@ -344,6 +278,8 @@ function TitleBar({
   setPreviewFocus,
   themeMode,
   setThemeMode,
+  onExport,
+  exportDisabled,
 }: {
   onDiscard: () => void;
   projectName: string;
@@ -359,6 +295,8 @@ function TitleBar({
   setPreviewFocus: (on: boolean) => void;
   themeMode: ThemeMode;
   setThemeMode: (next: ThemeMode) => void;
+  onExport: () => void;
+  exportDisabled: boolean;
 }) {
   return (
     <div className="titlebar" data-tauri-drag-region>
@@ -428,9 +366,10 @@ function TitleBar({
           )}
         </div>
         <button
-          className="export-btn disabled"
-          aria-disabled
-          data-tip="Coming soon"
+          className={`export-btn ${exportDisabled ? "disabled" : ""}`}
+          aria-disabled={exportDisabled || undefined}
+          data-tip={exportDisabled ? "Record something first" : undefined}
+          onClick={() => !exportDisabled && onExport()}
         >
           <Ico.upload size={13} /> Export
         </button>
@@ -1132,70 +1071,19 @@ function Canvas({
   previewFps: number;
 }) {
   const a = ASPECTS[aspect];
-  const maxW = viewportSize.w - 80;
-  const maxH = viewportSize.h - 110;
-  // Aspect of the actual video pixels — used to size the rounded wrapper to
-  // the displayed content rect (not the letterboxed bounding box) so the
-  // rounded corners follow the visible video edges.
-  // When a crop is applied the wrapper must follow the *cropped* region's
-  // aspect ratio, not the full frame's, so rounded corners hug the visible edges.
-  const rawVideoAR =
-    videoNaturalSize && videoNaturalSize.h > 0
-      ? videoNaturalSize.w / videoNaturalSize.h
-      : null;
-  const videoAR =
-    rawVideoAR && cropRect && cropRect.h > 0
-      ? rawVideoAR * (cropRect.w / cropRect.h)
-      : rawVideoAR;
-  // In "system" / auto mode we want uniform padding on all four sides, so the
-  // canvas is sized as (videoDisplay + 2·padding) rather than just matching
-  // the video's aspect ratio. Otherwise a 16:9 video inside a 16:9 canvas
-  // with equal CSS padding produces a non-video-AR inner box and the video
-  // letterboxes asymmetrically.
-  let w: number;
-  let h: number;
-  let ratio: number;
-  if (aspect === "system" && videoAR) {
-    const availW = Math.max(1, maxW - 2 * padding);
-    const availH = Math.max(1, maxH - 2 * padding);
-    let videoW = availW;
-    let videoH = availW / videoAR;
-    if (videoH > availH) {
-      videoH = availH;
-      videoW = availH * videoAR;
-    }
-    w = videoW + 2 * padding;
-    h = videoH + 2 * padding;
-    ratio = w / h;
-  } else {
-    ratio = a.w / a.h;
-    w = maxW;
-    h = maxW / ratio;
-    if (h > maxH) {
-      h = maxH;
-      w = maxH * ratio;
-    }
-  }
-
-  // Explicit pixel size for the video wrapper. The wrapper used to derive its
-  // size from the in-flow <video>'s intrinsic dimensions; once a crop makes the
-  // <video> absolutely positioned it no longer contributes layout size, so the
-  // wrapper would collapse to 0. Compute the displayed video box (contain fit
-  // of the effective aspect ratio inside the padded content area) directly.
-  let wrapPxW: number | null = null;
-  let wrapPxH: number | null = null;
-  if (videoAR) {
-    const innerW = Math.max(1, w - 2 * padding);
-    const innerH = Math.max(1, h - 2 * padding);
-    let bw = innerW;
-    let bh = innerW / videoAR;
-    if (bh > innerH) {
-      bh = innerH;
-      bw = innerH * videoAR;
-    }
-    wrapPxW = bw;
-    wrapPxH = bh;
-  }
+  // Frame/window geometry is shared with the offline exporter so the preview
+  // and the exported video can never drift. See lib/compositor.
+  const layout = computeFrameLayout({
+    aspectRatio: a.w / a.h,
+    isSystem: aspect === "system",
+    videoNaturalSize,
+    cropRect,
+    padding,
+    box: viewportSize,
+  });
+  const { w, h, ratio } = layout;
+  const wrapPxW = layout.wrapW;
+  const wrapPxH = layout.wrapH;
 
   // Drive the zoom transform on the video element from a RAF that reads the
   // live currentTime. Writing transforms directly (not via React state) keeps
@@ -1306,67 +1194,22 @@ function Canvas({
       el.style.transform = `translate(${sx - lastHot[0] * size}px, ${sy - lastHot[1] * size}px)`;
     };
     const apply = () => {
-      if (!zoomSettings.autoOn || zoomSegments.length === 0 || !cursorSidecar) {
-        wrap.style.transformOrigin = "0 0";
-        wrap.style.transform = "translate(0,0) scale(1)";
-        return;
-      }
-      const tMs = video.currentTime * 1000;
-      const { scale, focal } = resolveZoom(tMs, zoomSegments, cursorSidecar, smoothing);
-      // No active segment / scale ≈ 1: skip the focal-centering math entirely.
-      // Otherwise a focal of {0,0} would shift the video toward the top-left.
-      if (scale <= 1.001) {
-        wrap.style.transformOrigin = "0 0";
-        wrap.style.transform = "translate(0,0) scale(1)";
-        return;
-      }
-      const activeSeg = activeSegmentAt(tMs, zoomSegments);
-      const snapPct = Math.max(0, Math.min(100, activeSeg?.snapToEdges ?? DEFAULT_SNAP_TO_EDGES));
-      // Use unscaled layout box — getBoundingClientRect returns the
-      // *transformed* size, which would feed the previous frame's scale back
-      // into this frame and walk the focal toward the top-left.
-      const wrapW = wrap.offsetWidth;
-      const wrapH = wrap.offsetHeight;
-      // Map crop-local point coords → pixels inside the displayed video rect
-      // (objectFit: contain may letterbox the natural video inside the wrapper).
-      const vw = video.videoWidth || wrapW;
-      const vh = video.videoHeight || wrapH;
-      const fit = Math.min(wrapW / vw, wrapH / vh);
-      const displayedW = vw * fit;
-      const displayedH = vh * fit;
-      const offsetX = (wrapW - displayedW) / 2;
-      const offsetY = (wrapH - displayedH) / 2;
-      const crop = cursorSidecar.crop;
-      const refW = crop ? crop.width : cursorSidecar.display.width;
-      const refH = crop ? crop.height : cursorSidecar.display.height;
-      const rawPx = offsetX + (focal.x / Math.max(1, refW)) * displayedW;
-      const rawPy = offsetY + (focal.y / Math.max(1, refH)) * displayedH;
-      // Clamp the focal so the visible viewport stays inside the displayed
-      // video rect — otherwise centering a cursor near an edge would expose
-      // the letterbox / black background. `snapToEdges` relaxes the clamp:
-      // 0 = strict, 100 = full overrun allowed (camera follows focal verbatim).
-      // Crucially we ramp the relaxation with how-much-we've-zoomed: at the
-      // segment edge (scale≈1) halfVisible is wrapW/2 and any non-zero relax
-      // would jerk the focal far from center even though there's no real pan
-      // range yet. zoomProgress=0 at the edges, =1 at the peak.
-      const halfVisibleW = wrapW / (2 * scale);
-      const halfVisibleH = wrapH / (2 * scale);
-      const peakScale = activeSeg?.targetLevel ?? scale;
-      const zoomProgress = peakScale > 1
-        ? Math.max(0, Math.min(1, (scale - 1) / (peakScale - 1)))
-        : 0;
-      const relax = (snapPct / 100) * zoomProgress;
-      const minPx = offsetX + halfVisibleW * (1 - relax);
-      const maxPx = offsetX + displayedW - halfVisibleW * (1 - relax);
-      const minPy = offsetY + halfVisibleH * (1 - relax);
-      const maxPy = offsetY + displayedH - halfVisibleH * (1 - relax);
-      const px = minPx <= maxPx ? Math.min(maxPx, Math.max(minPx, rawPx)) : (offsetX + displayedW / 2);
-      const py = minPy <= maxPy ? Math.min(maxPy, Math.max(minPy, rawPy)) : (offsetY + displayedH / 2);
-      // Center the focal in the viewport: translate so px*scale + tx == viewport center.
-      const tx = wrapW / 2 - px * scale;
-      const ty = wrapH / 2 - py * scale;
+      // Shared with the offline exporter — see lib/compositor. Uses the
+      // unscaled layout box (offsetWidth) so a transformed measurement can't
+      // feed the previous frame's scale back into this one.
+      const zt = computeZoomTransform({
+        tMs: video.currentTime * 1000,
+        zoomEnabled: zoomSettings.autoOn,
+        zoomSegments,
+        cursorSidecar,
+        smoothing,
+        wrapW: wrap.offsetWidth,
+        wrapH: wrap.offsetHeight,
+        videoW: video.videoWidth,
+        videoH: video.videoHeight,
+      });
       wrap.style.transformOrigin = "0 0";
-      wrap.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+      wrap.style.transform = `translate(${zt.tx}px, ${zt.ty}px) scale(${zt.scale})`;
     };
     // previewFps === 0 means uncapped (full refresh rate). Otherwise throttle
     // the transform loop to the target interval to cut CPU/GPU usage.
@@ -2725,6 +2568,7 @@ export function Editor({
   const [currentTime, setCurrentTime] = useState(2.4);
   const [playing, setPlaying] = useState(false);
   const [cropOpen, setCropOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
   const [perfOpen, setPerfOpen] = useState(false);
   const [previewFocus, setPreviewFocus] = useState(false);
 
@@ -3146,6 +2990,8 @@ export function Editor({
         setPreviewFocus={setPreviewFocus}
         themeMode={themeMode}
         setThemeMode={setThemeMode}
+        onExport={() => setExportOpen(true)}
+        exportDisabled={!artifact || videoDuration == null}
       />
       <div className="editor-body">
         <Viewport
@@ -3222,6 +3068,34 @@ export function Editor({
           }}
         />
       )}
+      {exportOpen &&
+        artifact &&
+        videoDuration != null &&
+        videoNaturalSize && (
+          <ExportDialog
+            artifact={artifact}
+            videoDurationSec={videoDuration}
+            videoNaturalSize={videoNaturalSize}
+            aspectRatio={
+              ASPECTS[state.aspect].w / ASPECTS[state.aspect].h
+            }
+            isSystem={state.aspect === "system"}
+            wallpaper={state.wallpaper}
+            blur={state.blur}
+            padding={state.padding}
+            cropRect={state.cropRect}
+            cursorSidecar={cursorSidecar}
+            zoomSegments={zoomSegments}
+            zoomEnabled={zoomSettings.autoOn}
+            smoothing={Math.max(
+              0,
+              Math.min(1, zoomSettings.smoothing / 100),
+            )}
+            trimStart={state.trimStart}
+            trimEnd={state.trimEnd}
+            onClose={() => setExportOpen(false)}
+          />
+        )}
     </div>
   );
 }

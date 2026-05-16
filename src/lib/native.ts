@@ -148,6 +148,15 @@ export type MacWallpaper = {
   full: string;
 };
 
+export type ExportFormat = "mp4" | "gif";
+export type ExportPreset = "studio" | "social" | "web" | "weblow";
+
+export type ExportProgress = {
+  phase: "encoding";
+  done: number;
+  total: number;
+};
+
 export const native = {
   listMacWallpapers: () => invoke<MacWallpaper[]>("list_macos_wallpapers"),
   currentMacWallpaper: () => invoke<string | null>("current_macos_wallpaper"),
@@ -170,6 +179,56 @@ export const native = {
 
   saveProject: (defaultName: string, contents: string) =>
     invoke<string | null>("save_project", { defaultName, contents }),
+
+  // ---- Export -----------------------------------------------------------
+  exportBegin: (
+    width: number,
+    height: number,
+    fps: number,
+    format: ExportFormat,
+    preset: ExportPreset,
+  ) =>
+    invoke<string>("export_begin", { width, height, fps, format, preset }),
+  // Raw PNG bytes are sent as the IPC body (efficient, no JSON/base64); the
+  // session id + frame index ride along as headers.
+  exportFrame: (sessionId: string, index: number, png: Uint8Array) =>
+    invoke<void>(
+      "export_frame",
+      png.buffer.slice(
+        png.byteOffset,
+        png.byteOffset + png.byteLength,
+      ) as ArrayBuffer,
+      {
+        headers: {
+          "x-export-session": sessionId,
+          "x-export-index": String(index),
+        },
+      },
+    ),
+  exportFinish: (
+    sessionId: string,
+    outPath: string,
+    audioSrc: string | null,
+    audioStart: number,
+    audioEnd: number,
+  ) =>
+    invoke<string>("export_finish", {
+      sessionId,
+      outPath,
+      audioSrc,
+      audioStart,
+      audioEnd,
+    }),
+  exportCancel: (sessionId: string) =>
+    invoke<void>("export_cancel", { sessionId }),
+  pickExportPath: (defaultName: string, ext: string) =>
+    invoke<string | null>("pick_export_path", { defaultName, ext }),
+  copyFileToClipboard: (path: string) =>
+    invoke<void>("copy_file_to_clipboard", { path }),
+  onExportProgress: (
+    cb: (p: ExportProgress) => void,
+  ): Promise<UnlistenFn> =>
+    listen<ExportProgress>("export-progress", (e) => cb(e.payload)),
   openProject: () =>
     invoke<{ path: string; contents: string } | null>("open_project"),
   presentEditor: () => invoke<void>("present_editor"),
