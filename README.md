@@ -87,6 +87,10 @@ See [AGENTS.md](./AGENTS.md) for deeper architecture notes.
 - Real export pipeline (the Export button currently `alert()`s).
 - Richer timeline editing and effects.
 
+## Contributing
+
+Contributions are welcome — bug reports, docs, UI polish, and features. See **[CONTRIBUTION.md](./CONTRIBUTION.md)** for prerequisites, setup, conventions, and the pull-request checklist. For deeper architecture notes, see [AGENTS.md](./AGENTS.md).
+
 ## About
 
 Built and maintained by **[Glyph Software LLP](https://glyphsoftware.org)** — _Crafting Scalable Solutions for Modern Needs_. We build AI-powered and custom software: web/mobile, cloud infrastructure, data analytics, and generative AI systems, for startups and enterprises. Based in Bengaluru, India.
