@@ -10,7 +10,11 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "fetch-ffmpeg": "bash scripts/fetch-ffmpeg.sh",
-    "postinstall": "bash scripts/fetch-ffmpeg.sh"
+    "postinstall": "bash scripts/fetch-ffmpeg.sh",
+    "version": "bun run scripts/bump-version.ts",
+    "version:patch": "bun run scripts/bump-version.ts patch",
+    "version:minor": "bun run scripts/bump-version.ts minor",
+    "version:major": "bun run scripts/bump-version.ts major"
   },
   "dependencies": {
     "react": "^19.1.0",

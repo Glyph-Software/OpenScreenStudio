@@ -45,6 +45,19 @@ bunx tsc --noEmit      # type-check
 
 For Rust: `cd src-tauri && cargo check` / `cargo clippy`.
 
+### Bumping the app version
+
+There is no built-in Tauri version-bump command, so we ship one. It mirrors `npm version <patch|minor|major>` and keeps `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` (+ `Cargo.lock`) in sync — `tauri.conf.json > version` is what the macOS bundler reads into `CFBundleShortVersionString`.
+
+```sh
+bun run version:patch    # 0.2.1 -> 0.2.2
+bun run version:minor    # 0.2.1 -> 0.3.0
+bun run version:major    # 0.2.1 -> 1.0.0
+bun run version 1.2.3    # explicit semver
+```
+
+The script ([`scripts/bump-version.ts`](scripts/bump-version.ts)) refuses to run on a dirty tree, edits the three files, runs `cargo update -p openscreen-studio --offline`, then `git commit -m "v<next>"` and `git tag -a v<next>`. It does **not** push — run `git push --follow-tags` yourself. All three files must already share the same base version; if they drift, hand-align them before bumping.
+
 ## Project layout
 
 ```
