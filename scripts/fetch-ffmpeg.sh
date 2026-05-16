@@ -3,6 +3,9 @@
 # locations Tauri's `externalBin` expects:
 #   src-tauri/binaries/ffmpeg-aarch64-apple-darwin
 #   src-tauri/binaries/ffmpeg-x86_64-apple-darwin
+# Then lipo them into the universal binary the universal-apple-darwin
+# bundle target requires:
+#   src-tauri/binaries/ffmpeg-universal-apple-darwin
 #
 # Idempotent: skips download if a working binary already exists.
 
@@ -46,3 +49,19 @@ x64_url="${FFMPEG_X64_URL:-https://evermeet.cx/ffmpeg/getrelease/zip}"
 
 fetch "aarch64-apple-darwin" "$arm64_url"
 fetch "x86_64-apple-darwin"  "$x64_url"
+
+# Tauri's `externalBin` for --target universal-apple-darwin expects a single
+# pre-lipo'd binary; it does not combine arch binaries itself.
+universal="$out_dir/ffmpeg-universal-apple-darwin"
+if [ -x "$universal" ] && "$universal" -version >/dev/null 2>&1; then
+  echo "ffmpeg-universal-apple-darwin already present, skipping"
+else
+  echo "Creating universal ffmpeg binary..."
+  lipo -create \
+    "$out_dir/ffmpeg-aarch64-apple-darwin" \
+    "$out_dir/ffmpeg-x86_64-apple-darwin" \
+    -output "$universal"
+  chmod +x "$universal"
+  codesign --force --sign - "$universal" >/dev/null 2>&1 || true
+  echo "Installed $universal"
+fi
