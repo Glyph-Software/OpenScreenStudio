@@ -1,6 +1,6 @@
 [package]
 name = "openscreen-studio"
-version = "0.2.4"
+version = "0.2.5"
 description = "Open-source screen recording studio"
 authors = ["OpenScreen Studio contributors"]
 edition = "2021"
