@@ -74,19 +74,38 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and release
+      # Two variants: the Apple env vars must be ABSENT (not empty) when not
+      # signing — Tauri's bundler treats a defined-but-empty APPLE_CERTIFICATE
+      # as "present" and fails `security import` on the empty data. A
+      # `${{ ... || '' }}` expression always defines the var, so we instead
+      # split into a signed step and an env-free ad-hoc step.
+      - name: Build and release (signed)
+        if: steps.check_signing.outputs.enabled == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Apple signing vars are only passed when the cert validated above,
-          # so an absent/broken secret produces an ad-hoc build instead of
-          # failing the release. Fix the secret and signing resumes automatically.
-          APPLE_CERTIFICATE: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          APPLE_SIGNING_IDENTITY: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
-          APPLE_ID: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_ID || '' }}
-          APPLE_PASSWORD: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          # Use Bun for the Tauri CLI (repo is Bun-only).
+          tauriScript: bun run tauri
+          args: --target universal-apple-darwin
+          tagName: ${{ github.ref_name }}
+          releaseName: "OpenScreen Studio ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download and install this version."
+          releaseDraft: true
+          prerelease: false
+
+      # No Apple env vars at all -> Tauri falls back to ad-hoc signing.
+      - name: Build and release (ad-hoc, unsigned)
+        if: steps.check_signing.outputs.enabled != 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           # Use Bun for the Tauri CLI (repo is Bun-only).
           tauriScript: bun run tauri
