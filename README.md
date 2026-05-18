@@ -14,10 +14,11 @@ Real, in-process screen capture via **ScreenCaptureKit** with a polished editor:
 
 Download the latest `.dmg` from [Releases](https://github.com/Glyph-Software/OpenScreenStudio/releases), open it, and drag the app to Applications.
 
-Release builds are **not notarized by Apple** (this is a free open-source project without a paid Apple Developer account), so on first launch macOS will say the app "cannot be opened because Apple cannot check it for malicious software." To open it:
-
-- **Right-click** (or Control-click) the app → **Open** → **Open** again in the dialog, **or**
-- after the first blocked attempt, go to **System Settings → Privacy & Security** and click **Open Anyway**.
+> [!IMPORTANT]
+> Release builds are **not notarized by Apple** (this is a free open-source project without a paid Apple Developer account), so on first launch macOS will say the app "cannot be opened because Apple cannot check it for malicious software."
+> To open it:
+> - **Right-click** (or Control-click) the app → **Open** → **Open** again in the dialog, **or**
+> - after the first blocked attempt, go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
 You only need to do this once; afterwards it launches normally.
 
@@ -27,6 +28,9 @@ You only need to do this once; afterwards it launches normally.
 bun install            # installs JS deps; postinstall fetches bundled ffmpeg binaries
 bun run tauri dev      # run the desktop app (frontend + Rust)
 ```
+
+> [!WARNING]
+> The screen recording does not work while running in `dev` mode.
 
 > This project uses **Bun**. Never use `npm`/`npx`/`pnpm`/`yarn` — use `bunx <bin>` and `bun run <script>`.
 
