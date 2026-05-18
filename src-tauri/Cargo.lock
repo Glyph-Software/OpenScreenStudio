@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "openscreen-studio"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "core-foundation",
