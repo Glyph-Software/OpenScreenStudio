@@ -40,18 +40,53 @@ jobs:
       - name: Install dependencies
         run: bun install
 
+      # Validate the Apple signing cert up front. tauri-action attempts
+      # `security import` whenever APPLE_CERTIFICATE is non-empty and hard-fails
+      # on a malformed cert/password. Instead, gate signing on a cert that
+      # actually opens, so a missing/broken secret degrades to an ad-hoc build
+      # (green CI) and a correct secret auto-enables proper signing.
+      - name: Validate Apple signing certificate
+        id: check_signing
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "No APPLE_CERTIFICATE secret set — building ad-hoc signed."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          if ! printf '%s' "$APPLE_CERTIFICATE" | tr -d '[:space:]' \
+               | openssl base64 -d -A > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+            echo "::warning::APPLE_CERTIFICATE is not valid base64 — skipping code signing (ad-hoc build). Re-create the secret with: base64 -i cert.p12 | pbcopy"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if openssl pkcs12 -in "$tmp" -nokeys -passin pass:"${APPLE_CERTIFICATE_PASSWORD:-}" >/dev/null 2>&1 \
+             || openssl pkcs12 -legacy -in "$tmp" -nokeys -passin pass:"${APPLE_CERTIFICATE_PASSWORD:-}" >/dev/null 2>&1; then
+            echo "Apple certificate validated — code signing enabled."
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::APPLE_CERTIFICATE could not be opened with APPLE_CERTIFICATE_PASSWORD (corrupt .p12 or wrong password) — skipping code signing (ad-hoc build)."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Optional Apple code-signing / notarization. The build still
-          # succeeds (ad-hoc signed) if these secrets are not set.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Apple signing vars are only passed when the cert validated above,
+          # so an absent/broken secret produces an ad-hoc build instead of
+          # failing the release. Fix the secret and signing resumes automatically.
+          APPLE_CERTIFICATE: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ steps.check_signing.outputs.enabled == 'true' && secrets.APPLE_TEAM_ID || '' }}
         with:
           # Use Bun for the Tauri CLI (repo is Bun-only).
           tauriScript: bun run tauri

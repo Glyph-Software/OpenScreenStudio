@@ -10,6 +10,17 @@ An open-source [Screen Studio](https://screen.studio) clone for macOS, built wit
 
 Real, in-process screen capture via **ScreenCaptureKit** with a polished editor: auto-zoom-on-click, cursor overlay, wallpaper backgrounds, and project save/open. macOS only.
 
+## Install
+
+Download the latest `.dmg` from [Releases](https://github.com/Glyph-Software/OpenScreenStudio/releases), open it, and drag the app to Applications.
+
+Release builds are **not notarized by Apple** (this is a free open-source project without a paid Apple Developer account), so on first launch macOS will say the app "cannot be opened because Apple cannot check it for malicious software." To open it:
+
+- **Right-click** (or Control-click) the app → **Open** → **Open** again in the dialog, **or**
+- after the first blocked attempt, go to **System Settings → Privacy & Security** and click **Open Anyway**.
+
+You only need to do this once; afterwards it launches normally.
+
 ## Run
 
 ```sh
