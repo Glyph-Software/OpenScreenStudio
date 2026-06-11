@@ -382,6 +382,38 @@ input { font: inherit; color: inherit; }
 .hud-v2 .status-pill.on { color: var(--text-1); }
 .hud-v2 .status-pill:disabled { cursor: default; }
 
+/* Pill internals: icon button toggles the source; an invisible native select
+   over the label area picks the device (its menu is an OS popup, so it can
+   escape the tiny HUD window). */
+.hud-v2 .status-pill .pill-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
+  flex-shrink: 0;
+  border-radius: 6px;
+  padding: 2px;
+  margin: -2px;
+  transition: color 150ms;
+}
+.hud-v2 .status-pill .pill-toggle:hover:not(:disabled) { color: var(--text-1); }
+.hud-v2 .status-pill .pill-label {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+}
+.hud-v2 .status-pill:not(.disabled) .pill-label { cursor: pointer; }
+.hud-v2 .status-pill .pill-select {
+  position: absolute;
+  inset: 0 0 0 30px;
+  opacity: 0;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
 .hud-v2 .hud-gear {
   display: flex;
   align-items: center;
@@ -787,6 +819,34 @@ input { font: inherit; color: inherit; }
   transition: width 350ms var(--ease-default), height 350ms var(--ease-default), aspect-ratio 350ms var(--ease-default);
   overflow: hidden;
 }
+/* Camera bubble — frame-space overlay; geometry mirrored by drawCamera in
+   lib/compositor for exports. */
+.camera-overlay {
+  position: absolute;
+  z-index: 5;
+  overflow: hidden;
+  cursor: grab;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+  background: #000;
+}
+.camera-overlay:active { cursor: grabbing; }
+.camera-overlay.circle { border-radius: 50%; }
+.camera-overlay.rounded { border-radius: 18%; }
+.camera-overlay .camera-resize {
+  position: absolute;
+  right: 8%;
+  bottom: 8%;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.92);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  cursor: nwse-resize;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.camera-overlay:hover .camera-resize { opacity: 1; }
+
 .canvas-clip {
   position: absolute;
   inset: 0;
@@ -1138,6 +1198,8 @@ input { font: inherit; color: inherit; }
   color: var(--text-2);
 }
 .tl-gutter-row.clip { height: 56px; }
+.tl-gutter-row.camera { height: 26px; }
+.tl-gutter-row.audio { height: 36px; }
 .tl-gutter-row.zoom { height: 28px; margin-top: 6px; }
 .tl-gutter-row::after {
   content: "";
@@ -1167,6 +1229,8 @@ input { font: inherit; color: inherit; }
   overflow: visible;
 }
 .tl-track.zoom { height: 28px; margin-top: 6px; }
+.tl-track.camera { height: 26px; }
+.tl-track.audio { height: 36px; }
 .tl-track::after {
   content: "";
   position: absolute;
@@ -1379,6 +1443,119 @@ input { font: inherit; color: inherit; }
   position: absolute; left: 0; right: 0; bottom: 0;
   height: 100%;
   opacity: 0.55;
+}
+
+/* Camera track row: the camera clip span + position keyframe diamonds. */
+.camera-track-block {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 7px;
+  background: linear-gradient(180deg, #a06bd8 0%, #7d49b5 100%);
+  box-shadow: inset 0 0 0 0.5px rgba(255,255,255,0.18);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+  font-size: 10px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.95);
+  overflow: hidden;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.camera-track-block.off { filter: saturate(0.3); opacity: 0.55; }
+.camera-kf {
+  position: absolute;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  transform: translate(-50%, -50%) rotate(45deg);
+  background: #fff;
+  border-radius: 2px;
+  box-shadow: 0 0 4px rgba(0,0,0,0.6);
+  cursor: pointer;
+  z-index: 4;
+  transition: transform 100ms;
+}
+.camera-kf:hover {
+  transform: translate(-50%, -50%) rotate(45deg) scale(1.3);
+  background: var(--accent, #4f8cff);
+}
+
+/* Sidecar audio rows (system audio / microphone) */
+.audio-block {
+  position: absolute;
+  inset: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 0.5px rgba(255,255,255,0.18);
+}
+.audio-block.system { background: linear-gradient(180deg, #3d8bd4 0%, #2867ad 100%); }
+.audio-block.mic { background: linear-gradient(180deg, #3dab7c 0%, #258a5f 100%); }
+.audio-block.muted .waveform { opacity: 0.25; }
+.audio-block.muted { filter: saturate(0.35); }
+.tl-track.audio.selected .audio-block {
+  box-shadow: inset 0 0 0 1.5px var(--accent, #4f8cff);
+}
+.audio-block .waveform {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 100%;
+  opacity: 0.6;
+}
+.audio-block .audio-silent {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.45);
+  pointer-events: none;
+}
+.audio-block .audio-trim-shade {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: rgba(0,0,0,0.55);
+  pointer-events: none;
+  z-index: 2;
+}
+.audio-block .audio-mute {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(0,0,0,0.28);
+  color: rgba(255,255,255,0.95);
+  font-size: 10px;
+  font-weight: 600;
+  z-index: 3;
+  cursor: pointer;
+}
+.audio-block .audio-mute:hover { background: rgba(0,0,0,0.45); }
+.audio-block .audio-trim-handle {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+  z-index: 4;
+}
+.audio-block .audio-trim-handle::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 4px; bottom: 4px;
+  width: 3px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.9);
+  box-shadow: 0 0 3px rgba(0,0,0,0.5);
 }
 
 .zoom-pill {

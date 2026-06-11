@@ -8,6 +8,8 @@ import {
   exportVideo,
   formatBytes,
   resolveOutputDims,
+  type ExportAudioTrack,
+  type ExportCameraTrack,
   type ExportResolution,
   type ExportTarget,
 } from "../../lib/exporter";
@@ -88,6 +90,8 @@ export function ExportDialog(props: {
   smoothing: number;
   trimStart: number;
   trimEnd: number;
+  audioTracks: ExportAudioTrack[];
+  camera: ExportCameraTrack | null;
   onClose: () => void;
 }) {
   const [format, setFormat] = useState<ExportFormat>("mp4");
@@ -195,6 +199,8 @@ export function ExportDialog(props: {
       smoothing: props.smoothing,
       trimStart: props.trimStart,
       trimEnd: props.trimEnd,
+      audioTracks: props.audioTracks,
+      camera: props.camera,
       viewportBox: box,
       resolution,
       fps,

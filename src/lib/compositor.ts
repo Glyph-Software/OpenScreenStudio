@@ -428,6 +428,45 @@ function paintWallpaper(
   ctx.fillRect(x, y, w, h);
 }
 
+/**
+ * Rasterize the wallpaper layer (gradient/image + blur + inset bleed) into an
+ * offscreen 2D canvas. The layer is static for a given (wallpaper, blur,
+ * output size), so GPU paths bake it once and re-draw it as a texture.
+ */
+export function renderWallpaperToCanvas(o: {
+  layoutW: number;
+  layoutH: number;
+  s: number;
+  outW: number;
+  outH: number;
+  wallpaper: string;
+  wallpaperImg: CanvasImageSource | null;
+  blur: number;
+}): HTMLCanvasElement {
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(o.outW));
+  c.height = Math.max(1, Math.round(o.outH));
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("Could not create wallpaper canvas context");
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, c.width, c.height);
+  ctx.clip();
+  if (o.blur > 0) ctx.filter = `blur(${o.blur * 0.18 * o.s}px)`;
+  const ins = o.blur > 0 ? o.blur * 0.3 + 4 : 0;
+  paintWallpaper(
+    ctx,
+    -ins * o.s,
+    -ins * o.s,
+    (o.layoutW + 2 * ins) * o.s,
+    (o.layoutH + 2 * ins) * o.s,
+    o.wallpaper,
+    o.wallpaperImg,
+  );
+  ctx.restore();
+  return c;
+}
+
 // ---------------------------------------------------------------------------
 // renderFrame — composite one frame, mirroring the preview DOM stack
 // ---------------------------------------------------------------------------
@@ -461,6 +500,63 @@ const ZOOM_BLUR_SHUTTER = 1.0;
 // smoother gradient, no visible ghost steps), clamped to MAX_SAMPLES.
 const ZOOM_BLUR_PX_PER_SAMPLE = 3;
 
+/** A camera position/size keyframe. `t` is timeline seconds. */
+export type CameraKeyframe = {
+  t: number;
+  pos: { x: number; y: number };
+  size: number;
+};
+
+/**
+ * Evaluate the camera bubble's position/size at time `tSec`. With no
+ * keyframes the static base pos/size applies; otherwise the value eases
+ * (smoothstep) between surrounding keyframes and clamps at the ends.
+ * Shared by the editor preview and the exporter so motion is identical.
+ */
+export function cameraAt(
+  cam: { pos: { x: number; y: number }; size: number; keyframes?: CameraKeyframe[] },
+  tSec: number,
+): { pos: { x: number; y: number }; size: number } {
+  const kfs = cam.keyframes ?? [];
+  if (kfs.length === 0) return { pos: cam.pos, size: cam.size };
+  if (tSec <= kfs[0].t) return { pos: kfs[0].pos, size: kfs[0].size };
+  const last = kfs[kfs.length - 1];
+  if (tSec >= last.t) return { pos: last.pos, size: last.size };
+  for (let i = 0; i < kfs.length - 1; i++) {
+    const a = kfs[i];
+    const b = kfs[i + 1];
+    if (tSec >= a.t && tSec <= b.t) {
+      const span = Math.max(1e-6, b.t - a.t);
+      let f = (tSec - a.t) / span;
+      f = f * f * (3 - 2 * f); // smoothstep ease-in-out
+      return {
+        pos: {
+          x: a.pos.x + (b.pos.x - a.pos.x) * f,
+          y: a.pos.y + (b.pos.y - a.pos.y) * f,
+        },
+        size: a.size + (b.size - a.size) * f,
+      };
+    }
+  }
+  return { pos: last.pos, size: last.size };
+}
+
+/**
+ * Camera bubble parameters for one composited frame. The bubble lives in
+ * frame space (not video space): it must NOT inherit the zoom transform —
+ * the bubble stays put while the screen content zooms underneath it.
+ */
+export type CameraRenderOpts = {
+  source: CanvasImageSource;
+  naturalSize: { w: number; h: number };
+  /** Bubble center, normalized 0..1 over the output frame. */
+  pos: { x: number; y: number };
+  /** Bubble edge as a fraction of the output frame width (square box). */
+  size: number;
+  shape: "circle" | "rounded";
+  mirrored: boolean;
+};
+
 export type RenderFrameOpts = {
   layout: FrameLayout;
   /** Output px per layout px (= outputHeight / layout.h). */
@@ -483,7 +579,101 @@ export type RenderFrameOpts = {
   cursorState: CursorRenderState;
   /** Fixed timestep for cursor low-pass (1/fps). */
   dtSec: number;
+  /** Camera bubble; omitted/null when no camera track or it's hidden. */
+  camera?: CameraRenderOpts | null;
 };
+
+/** Crop source rect (video px) + object-fit:contain dest rect (layout px). */
+export type VideoPlacement = {
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  dX: number;
+  dY: number;
+  dW: number;
+  dH: number;
+};
+
+export function computeVideoPlacement(o: {
+  layout: FrameLayout;
+  videoNaturalSize: { w: number; h: number };
+  cropRect: CropRect | null;
+}): VideoPlacement {
+  const vnW = o.videoNaturalSize.w;
+  const vnH = o.videoNaturalSize.h;
+  let sx = 0;
+  let sy = 0;
+  let sw = vnW;
+  let sh = vnH;
+  if (o.cropRect) {
+    sx = o.cropRect.x * vnW;
+    sy = o.cropRect.y * vnH;
+    sw = o.cropRect.w * vnW;
+    sh = o.cropRect.h * vnH;
+  }
+  const srcAR = sw / sh;
+  const wrapAR = o.layout.wrapW / o.layout.wrapH;
+  let dW = o.layout.wrapW;
+  let dH = o.layout.wrapH;
+  if (srcAR > wrapAR) dH = o.layout.wrapW / srcAR;
+  else dW = o.layout.wrapH * srcAR;
+  const dX = (o.layout.wrapW - dW) / 2;
+  const dY = (o.layout.wrapH - dH) / 2;
+  return { sx, sy, sw, sh, dX, dY, dW, dH };
+}
+
+/** Resolve the zoom transform at `tMs` for one frame's options. */
+export function zoomTransformAt(o: RenderFrameOpts, tMs: number): ZoomTransform {
+  return computeZoomTransform({
+    tMs,
+    zoomEnabled: o.zoomEnabled,
+    zoomSegments: o.zoomSegments,
+    cursorSidecar: o.cursorSidecar,
+    smoothing: o.smoothing,
+    wrapW: o.layout.wrapW,
+    wrapH: o.layout.wrapH,
+    videoW: o.videoNaturalSize.w,
+    videoH: o.videoNaturalSize.h,
+  });
+}
+
+/**
+ * Plan the video layer passes for one frame: a single sharp pass while the
+ * zoom transform is static, or N samples along the trailing shutter interval
+ * (each with the incremental-average alpha) while it is moving. Shared by
+ * the Canvas2D and WebGL compositors so motion blur is identical.
+ */
+export function computeVideoPasses(
+  o: RenderFrameOpts,
+): Array<{ zt: ZoomTransform; alpha: number }> {
+  const ztEnd = zoomTransformAt(o, o.timeMs);
+  const dtMs = o.dtSec * 1000;
+  const ztStart = dtMs > 0 ? zoomTransformAt(o, o.timeMs - dtMs) : ztEnd;
+  const dScale = Math.abs(ztEnd.scale - ztStart.scale);
+  const dShiftPx =
+    Math.max(Math.abs(ztEnd.tx - ztStart.tx), Math.abs(ztEnd.ty - ztStart.ty)) *
+    o.s;
+  const moving = dtMs > 0 && (dScale > 0.002 || dShiftPx > 0.5);
+  if (!moving) return [{ zt: ztEnd, alpha: 1 }];
+  const motionPx =
+    dShiftPx + dScale * Math.max(o.layout.wrapW, o.layout.wrapH) * o.s;
+  const samples = Math.max(
+    2,
+    Math.min(
+      ZOOM_BLUR_MAX_SAMPLES,
+      Math.ceil(motionPx / ZOOM_BLUR_PX_PER_SAMPLE),
+    ),
+  );
+  const passes: Array<{ zt: ZoomTransform; alpha: number }> = [];
+  for (let i = 0; i < samples; i++) {
+    const f = i / (samples - 1);
+    const tMs = o.timeMs - dtMs * ZOOM_BLUR_SHUTTER * (1 - f);
+    // Incremental running average ⇒ each sample ends weighted 1/samples.
+    passes.push({ zt: zoomTransformAt(o, tMs), alpha: 1 / (i + 1) });
+  }
+  return passes;
+}
 
 export function renderFrame(
   ctx: CanvasRenderingContext2D,
@@ -514,40 +704,8 @@ export function renderFrame(
   // 2. Recorded window: translate to wrap origin, apply the zoom transform,
   //    clip to the rounded rect. Cursor is drawn in the same transformed
   //    space (it is a child of the wrap in the preview DOM).
-  const ztAt = (tMs: number) =>
-    computeZoomTransform({
-      tMs,
-      zoomEnabled: o.zoomEnabled,
-      zoomSegments: o.zoomSegments,
-      cursorSidecar: o.cursorSidecar,
-      smoothing: o.smoothing,
-      wrapW: layout.wrapW,
-      wrapH: layout.wrapH,
-      videoW: o.videoNaturalSize.w,
-      videoH: o.videoNaturalSize.h,
-    });
-
   // Video crop sub-rect + object-fit: contain placement (zoom-independent).
-  const vnW = o.videoNaturalSize.w;
-  const vnH = o.videoNaturalSize.h;
-  let sx = 0;
-  let sy = 0;
-  let sw = vnW;
-  let sh = vnH;
-  if (o.cropRect) {
-    sx = o.cropRect.x * vnW;
-    sy = o.cropRect.y * vnH;
-    sw = o.cropRect.w * vnW;
-    sh = o.cropRect.h * vnH;
-  }
-  const srcAR = sw / sh;
-  const wrapAR = layout.wrapW / layout.wrapH;
-  let dW = layout.wrapW;
-  let dH = layout.wrapH;
-  if (srcAR > wrapAR) dH = layout.wrapW / srcAR;
-  else dW = layout.wrapH * srcAR;
-  const dX = (layout.wrapW - dW) / 2;
-  const dY = (layout.wrapH - dH) / 2;
+  const { sx, sy, sw, sh, dX, dY, dW, dH } = computeVideoPlacement(o);
 
   const rw = layout.wrapW * s;
   const rh = layout.wrapH * s;
@@ -585,58 +743,111 @@ export function renderFrame(
       );
     });
 
-  const ztEnd = ztAt(o.timeMs);
-  const dtMs = o.dtSec * 1000;
-  const ztStart = dtMs > 0 ? ztAt(o.timeMs - dtMs) : ztEnd;
-
   // 2a. Video frame. Average several samples along the zoom curve while the
   //     transform is moving; otherwise a single sharp pass.
-  const dScale = Math.abs(ztEnd.scale - ztStart.scale);
-  const dShiftPx =
-    Math.max(Math.abs(ztEnd.tx - ztStart.tx), Math.abs(ztEnd.ty - ztStart.ty)) *
-    s;
-  const moving = dtMs > 0 && (dScale > 0.002 || dShiftPx > 0.5);
-  if (moving) {
-    // Scale sample count with on-screen motion magnitude, capped.
-    const motionPx =
-      dShiftPx +
-      dScale * Math.max(layout.wrapW, layout.wrapH) * s;
-    const samples = Math.max(
-      2,
-      Math.min(
-        ZOOM_BLUR_MAX_SAMPLES,
-        Math.ceil(motionPx / ZOOM_BLUR_PX_PER_SAMPLE),
-      ),
-    );
-    for (let i = 0; i < samples; i++) {
-      const f = i / (samples - 1);
-      const tMs = o.timeMs - dtMs * ZOOM_BLUR_SHUTTER * (1 - f);
-      // Incremental running average ⇒ each sample ends weighted 1/samples.
-      paintVideo(ztAt(tMs), 1 / (i + 1));
-    }
-  } else {
-    paintVideo(ztEnd, 1);
-  }
+  for (const pass of computeVideoPasses(o)) paintVideo(pass.zt, pass.alpha);
 
   // 2b. Synthetic cursor — kept sharp, drawn once at the final transform
   //     (its low-pass state must advance exactly one step per frame).
   if (o.cursorSidecar) {
-    inZoomSpace(ztEnd, () => drawCursor(ctx, o, s));
+    inZoomSpace(zoomTransformAt(o, o.timeMs), () => drawCursor(ctx, o, s));
+  }
+
+  // 3. Camera bubble — topmost, in plain output (frame) space so it is
+  //    unaffected by the zoom transform. Mirrors the preview overlay DOM.
+  if (o.camera) {
+    drawCamera(ctx, o.camera, outW, outH, s);
   }
   ctx.restore();
 }
 
-function drawCursor(
+function cameraBoxPath(
   ctx: CanvasRenderingContext2D,
-  o: RenderFrameOpts,
+  x: number,
+  y: number,
+  box: number,
+  r: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + box, y, x + box, y + box, r);
+  ctx.arcTo(x + box, y + box, x, y + box, r);
+  ctx.arcTo(x, y + box, x, y, r);
+  ctx.arcTo(x, y, x + box, y, r);
+  ctx.closePath();
+}
+
+function drawCamera(
+  ctx: CanvasRenderingContext2D,
+  cam: CameraRenderOpts,
+  outW: number,
+  outH: number,
   s: number,
 ) {
-  const sc = o.cursorSidecar!;
+  const box = cam.size * outW;
+  if (box < 2) return;
+  const x = cam.pos.x * outW - box / 2;
+  const y = cam.pos.y * outH - box / 2;
+  // Keep in sync with the .camera-overlay CSS (50% vs 18% corner radius).
+  const r = cam.shape === "circle" ? box / 2 : box * 0.18;
+
+  // Drop shadow: fill the bubble path once with shadow enabled; the video
+  // painted next fully covers the fill.
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,0.35)";
+  ctx.shadowBlur = 18 * s;
+  ctx.shadowOffsetY = 6 * s;
+  cameraBoxPath(ctx, x, y, box, r);
+  ctx.fillStyle = "#000";
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  cameraBoxPath(ctx, x, y, box, r);
+  ctx.clip();
+  // object-fit: cover into the square box.
+  const vw = Math.max(1, cam.naturalSize.w);
+  const vh = Math.max(1, cam.naturalSize.h);
+  const scale = Math.max(box / vw, box / vh);
+  const dw = vw * scale;
+  const dh = vh * scale;
+  const dx = x + (box - dw) / 2;
+  const dy = y + (box - dh) / 2;
+  if (cam.mirrored) {
+    ctx.translate(x + box / 2, 0);
+    ctx.scale(-1, 1);
+    ctx.translate(-(x + box / 2), 0);
+  }
+  ctx.drawImage(cam.source, dx, dy, dw, dh);
+  ctx.restore();
+}
+
+/**
+ * Cursor glyph placement for one frame, in zoom-space layout px. Advances the
+ * caller's low-pass smoothing state exactly one step — call once per frame.
+ * Null when the cursor is absent or outside the (cropped) frame.
+ */
+export type CursorSprite = {
+  /** Smoothed hotspot position (layout px, zoom space). */
+  x: number;
+  y: number;
+  /** Glyph box edge (layout px). */
+  size: number;
+  shape: CursorSidecarShapeName;
+  hot: [number, number];
+};
+
+export function computeCursorSprite(o: RenderFrameOpts): CursorSprite | null {
+  if (!o.cursorSidecar) {
+    o.cursorState.has = false;
+    return null;
+  }
+  const sc = o.cursorSidecar;
   const tMs = o.timeMs;
   const pos = cursorPosAt(sc, tMs);
   if (!pos) {
     o.cursorState.has = false;
-    return;
+    return null;
   }
   const wrapW = o.layout.wrapW;
   const wrapH = o.layout.wrapH;
@@ -662,7 +873,7 @@ function drawCursor(
   }
   if (nx < 0 || nx > 1 || ny < 0 || ny > 1) {
     o.cursorState.has = false;
-    return;
+    return null;
   }
   const px = oX + nx * dW;
   const py = oY + ny * dH;
@@ -682,16 +893,25 @@ function drawCursor(
   const pxPerRefUnit = dW / Math.max(1, refUnitsAcross);
   const size = Math.max(14, Math.min(64, 24 * pxPerRefUnit));
   const shape = cursorShapeAt(sc, tMs);
-  const img = o.glyphImages.get(shape) ?? o.glyphImages.get("arrow");
+  return { x: st.sx, y: st.sy, size, shape, hot: glyphFor(shape).hot };
+}
+
+function drawCursor(
+  ctx: CanvasRenderingContext2D,
+  o: RenderFrameOpts,
+  s: number,
+) {
+  const spr = computeCursorSprite(o);
+  if (!spr) return;
+  const img = o.glyphImages.get(spr.shape) ?? o.glyphImages.get("arrow");
   if (!img) return;
-  const g = glyphFor(shape);
-  const drawX = (st.sx - g.hot[0] * size) * s;
-  const drawY = (st.sy - g.hot[1] * size) * s;
+  const drawX = (spr.x - spr.hot[0] * spr.size) * s;
+  const drawY = (spr.y - spr.hot[1] * spr.size) * s;
   ctx.save();
   ctx.shadowColor = "rgba(0,0,0,0.45)";
   ctx.shadowBlur = 2 * s;
   ctx.shadowOffsetY = 1 * s;
-  ctx.drawImage(img, drawX, drawY, size * s, size * s);
+  ctx.drawImage(img, drawX, drawY, spr.size * s, spr.size * s);
   ctx.restore();
 }
 

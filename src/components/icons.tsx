@@ -44,6 +44,7 @@ export const Ico = {
   webcam: (p: IcoProps) => <Sv {...p}><rect x="3" y="6" width="14" height="12" rx="2"/><path d="M17 10l4-2v8l-4-2z"/></Sv>,
   speech: (p: IcoProps) => <Sv {...p}><path d="M21 12a8 8 0 1 1-3.5-6.6L21 4l-1 4.4A8 8 0 0 1 21 12z"/><path d="M8 11h8M8 14h5"/></Sv>,
   audio: (p: IcoProps) => <Sv {...p}><path d="M11 5L6 9H3v6h3l5 4V5zM15 9a4 4 0 0 1 0 6"/></Sv>,
+  audioMuted: (p: IcoProps) => <Sv {...p}><path d="M11 5L6 9H3v6h3l5 4V5z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></Sv>,
   cmd: (p: IcoProps) => <Sv {...p}><path d="M9 9h6v6H9z"/><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.5 8.5L8 8M16 8l-.5.5M8.5 15.5L8 16M16 16l-.5-.5"/></Sv>,
   link: (p: IcoProps) => <Sv {...p}><path d="M10 14a4 4 0 0 0 5.6 0l3.4-3.4a4 4 0 0 0-5.6-5.6L12 6.4M14 10a4 4 0 0 0-5.6 0L5 13.4a4 4 0 0 0 5.6 5.6L12 17.6"/></Sv>,
   image: (p: IcoProps) => <Sv {...p}><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="1.5" fill="currentColor"/><path d="m4 17 5-4 4 3 3-2 4 3"/></Sv>,
@@ -74,6 +75,26 @@ export const Ico = {
     </Sv>
   ),
   device: (p: IcoProps) => <Sv {...p}><rect x="7" y="2.5" width="10" height="19" rx="2"/><circle cx="12" cy="18" r="0.8" fill="currentColor" stroke="none"/></Sv>,
+  camera: (p: IcoProps) => (
+    <Sv {...p}>
+      <path d="M3 7a2 2 0 0 1 2-2h7l2 3h2a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+    </Sv>
+  ),
+  mic: (p: IcoProps) => (
+    <Sv {...p}>
+      <path d="M9 4.5a3 3 0 0 1 6 0V11a3 3 0 0 1-6 0V4.5z" />
+      <path d="M5 11a7 7 0 0 0 14 0" />
+      <path d="M12 18v3" />
+    </Sv>
+  ),
+  systemAudio: (p: IcoProps) => (
+    <Sv {...p}>
+      <rect x="4" y="3.5" width="16" height="17" rx="2" />
+      <path d="M10 16V9l4-1v6" />
+      <circle cx="9" cy="16" r="1.4" />
+      <circle cx="13" cy="15" r="1.4" />
+    </Sv>
+  ),
   cameraSlash: (p: IcoProps) => (
     <Sv {...p}>
       <path d="M3 7a2 2 0 0 1 2-2h7l2 3h2a2 2 0 0 1 2 2v6" />

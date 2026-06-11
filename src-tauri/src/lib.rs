@@ -5,11 +5,17 @@
 //!   The TCC permission attaches to the .app bundle, so once the user grants
 //!   Screen Recording once, every recording Just Works — no ffmpeg sidecar,
 //!   no AVFoundation device indices, no per-binary permission dance.
-//! - Audio device enumeration still uses ffmpeg's `-list_devices` output so
-//!   the HUD can show available microphones. Capture itself uses SCK's
-//!   built-in microphone capture path.
+//! - System audio and microphone are tapped off the same SCStream as raw PCM
+//!   (`SCStreamOutputType::Audio` / `::Microphone`) and written to sidecar
+//!   WAVs next to the mp4, so the editor gets independently editable tracks.
+//!   Microphone enumeration uses the SCK bridge's `AudioInputDevice::list()`.
 //! - Mic-level metering uses `cpal` to sample the default input and emits
 //!   `mic-level` events at ~30 Hz with the current peak in [0.0, 1.0].
+
+#[cfg(target_os = "macos")]
+mod audio_tap;
+#[cfg(target_os = "macos")]
+mod camera;
 
 use std::{
     fs,
@@ -34,6 +40,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 
 #[cfg(target_os = "macos")]
 use screencapturekit::{
+    audio_devices::AudioInputDevice,
     cg::CGRect as SCKRect,
     recording_output::{
         RecordingCallbacks, SCRecordingOutput, SCRecordingOutputCodec,
@@ -44,9 +51,13 @@ use screencapturekit::{
         configuration::{pixel_format::PixelFormat, SCStreamConfiguration},
         content_filter::SCContentFilter,
         delegate_trait::StreamCallbacks,
+        output_type::SCStreamOutputType,
         sc_stream::SCStream,
     },
 };
+
+#[cfg(target_os = "macos")]
+use audio_tap::{concat_wav_segments, AudioTap, VideoAnchor};
 
 #[cfg(target_os = "macos")]
 pub fn probe_screen_recording_and_exit() -> ! {
@@ -220,10 +231,10 @@ fn dismiss_permissions(app: AppHandle) -> Result<(), String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureSource {
-    pub id: String,
-    pub kind: String,  // "screen" | "camera" | "audio"
+    pub id: String,    // native device id (SCK mic id / AVCaptureDevice uniqueID)
+    pub kind: String,  // "camera" | "audio"
     pub label: String,
-    pub index: u32,    // AVFoundation device index
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +243,19 @@ pub struct CaptureArtifact {
     pub id: String,
     pub path: String,
     pub duration_ms: u64,
+    /// Sidecar WAV with the system (app) audio, when it was recorded.
+    #[serde(default)]
+    pub system_audio_path: Option<String>,
+    /// Sidecar WAV with the microphone audio, when it was recorded.
+    #[serde(default)]
+    pub mic_path: Option<String>,
+    /// Sidecar movie with the camera recording, when it was recorded.
+    #[serde(default)]
+    pub camera_path: Option<String>,
+    /// Camera start relative to the screen recording start (ms; positive
+    /// means the camera file starts later than the screen file).
+    #[serde(default)]
+    pub camera_offset_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,7 +272,15 @@ pub struct CropRect {
 pub struct StartCaptureArgs {
     pub display_id: u32,
     pub window_id: Option<u32>,
-    pub audio_index: Option<u32>,
+    /// Record system (app) audio to a sidecar WAV.
+    #[serde(default)]
+    pub system_audio: bool,
+    /// Record this microphone (SCK device id) to a sidecar WAV.
+    #[serde(default)]
+    pub mic_device_id: Option<String>,
+    /// Record this camera (AVCaptureDevice uniqueID) to a sidecar movie.
+    #[serde(default)]
+    pub camera_device_id: Option<String>,
     pub framerate: Option<u32>,
     pub crop: Option<CropRect>,
 }
@@ -348,6 +380,10 @@ struct SegmentRecorder {
     stream: SCStream,
     _recording_output: SCRecordingOutput,
     segment_path: PathBuf,
+    // WAV taps on the same SCStream (one per enabled audio track). Finalized
+    // when the segment stops; their files concat into the final track WAVs.
+    system_tap: Option<AudioTap>,
+    mic_tap: Option<AudioTap>,
     // Set true before we call `stream.stop_capture()` from our own code path
     // so the SCK delegate's `on_stop` firing is recognised as expected and
     // doesn't emit a duplicate "recording-stopped-externally" event.
@@ -364,6 +400,12 @@ struct ActiveRecording {
     // Segment files already finalised (one entry per pause). On stop these
     // are concatenated into `final_output` with ffmpeg.
     segments: Vec<PathBuf>,
+    // Finalised per-segment audio WAVs, parallel to `segments` in time (but
+    // only present for segments where the track was enabled and produced data).
+    system_segments: Vec<PathBuf>,
+    mic_segments: Vec<PathBuf>,
+    // Parallel camera recording (own AVCaptureSession on its own thread).
+    camera: Option<camera::CameraRecorder>,
     final_output: PathBuf,
     cursor_track: Arc<CursorTrack>,
     cursor_stop: Arc<AtomicBool>,
@@ -390,51 +432,6 @@ struct MicMeter {
 #[derive(Default)]
 struct MeterState(Mutex<Option<MicMeter>>);
 
-fn parse_ffmpeg_devices(stderr: &str) -> Vec<CaptureSource> {
-    // ffmpeg prints lines like:
-    //   [AVFoundation indev @ 0x...] AVFoundation video devices:
-    //   [AVFoundation indev @ 0x...] [3] Capture screen 0
-    //   [AVFoundation indev @ 0x...] AVFoundation audio devices:
-    //   [AVFoundation indev @ 0x...] [1] MacBook Pro Microphone
-    let mut sources = Vec::new();
-    let mut section: Option<&str> = None;
-    for raw in stderr.lines() {
-        let line = raw.trim();
-        if line.contains("AVFoundation video devices:") {
-            section = Some("video");
-            continue;
-        }
-        if line.contains("AVFoundation audio devices:") {
-            section = Some("audio");
-            continue;
-        }
-        let Some(sec) = section else { continue };
-        // Extract "[N] Label" after the closing bracket of the prefix
-        let Some(rest) = line.split("] ").nth(1) else { continue };
-        // rest looks like "[3] Capture screen 0"
-        if !rest.starts_with('[') {
-            continue;
-        }
-        let Some(close) = rest.find(']') else { continue };
-        let idx_str = &rest[1..close];
-        let Ok(index) = idx_str.parse::<u32>() else { continue };
-        let label = rest[close + 1..].trim().to_string();
-        let (kind, id_prefix) = match (sec, label.to_lowercase().contains("screen")) {
-            ("video", true) => ("screen", "screen"),
-            ("video", false) => ("camera", "camera"),
-            ("audio", _) => ("audio", "audio"),
-            _ => continue,
-        };
-        sources.push(CaptureSource {
-            id: format!("{id_prefix}:{index}"),
-            kind: kind.into(),
-            label,
-            index,
-        });
-    }
-    sources
-}
-
 /// Resolve the bundled ffmpeg sidecar.
 ///
 /// Tauri's `externalBin` ships the binary next to the main executable. In a
@@ -458,16 +455,36 @@ fn ffmpeg_path() -> PathBuf {
     suffixed
 }
 
+/// Enumerate recordable input devices: microphones via the SCK bridge (their
+/// ids feed `with_microphone_capture_device_id` directly) and cameras via
+/// AVFoundation (uniqueIDs feed the camera recorder).
 #[tauri::command]
 fn list_capture_sources() -> Result<Vec<CaptureSource>, String> {
-    let output = Command::new(ffmpeg_path())
-        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to invoke bundled ffmpeg: {e}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(parse_ffmpeg_devices(&stderr))
+    #[cfg(target_os = "macos")]
+    {
+        let mut sources: Vec<CaptureSource> = AudioInputDevice::list()
+            .into_iter()
+            .map(|d| CaptureSource {
+                id: d.id,
+                kind: "audio".into(),
+                label: d.name,
+                is_default: d.is_default,
+            })
+            .collect();
+        sources.extend(camera::list_camera_devices());
+        Ok(sources)
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(Vec::new())
+}
+
+/// Fire the async camera TCC prompt if it hasn't been answered yet. The HUD
+/// calls this when the camera pill is toggled on, so the prompt is resolved
+/// before a recording ever starts.
+#[tauri::command]
+fn request_camera_access() {
+    #[cfg(target_os = "macos")]
+    camera::request_camera_access();
 }
 
 fn output_path(id: &str) -> PathBuf {
@@ -595,10 +612,20 @@ fn build_and_start_segment(
         }
     }
 
-    if args.audio_index.is_some() {
+    let wants_system = args.system_audio;
+    let wants_mic = args.mic_device_id.is_some();
+    if wants_system {
         config = config
             .with_captures_audio(true)
-            .with_captures_microphone(true);
+            .with_excludes_current_process_audio(true)
+            .with_sample_rate(48_000)
+            .with_channel_count(2);
+    }
+    if wants_mic {
+        config = config.with_captures_microphone(true);
+        if let Some(id) = args.mic_device_id.as_deref().filter(|s| !s.is_empty()) {
+            config = config.with_microphone_capture_device_id(id);
+        }
     }
 
     let rec_config = SCRecordingOutputConfiguration::new()
@@ -642,10 +669,51 @@ fn build_and_start_segment(
     let rec_output = SCRecordingOutput::new_with_delegate(&rec_config, rec_delegate)
         .ok_or_else(|| "Failed to create SCRecordingOutput (requires macOS 15+).".to_string())?;
 
-    let stream = SCStream::new_with_delegate(&filter, &config, stream_delegate);
+    let mut stream = SCStream::new_with_delegate(&filter, &config, stream_delegate);
     stream
         .add_recording_output(&rec_output)
         .map_err(|e| format!("add_recording_output failed: {e:?}"))?;
+
+    // Audio taps. The WAVs must start exactly at the video segment's first
+    // frame; a Screen output handler records that frame's timestamp (all
+    // outputs share the stream clock) and each tap aligns against it.
+    let mut system_tap = None;
+    let mut mic_tap = None;
+    if wants_system || wants_mic {
+        let video_anchor: VideoAnchor = Arc::new(Mutex::new(None));
+        {
+            let anchor = Arc::clone(&video_anchor);
+            stream.add_output_handler(
+                move |sample: screencapturekit::cm::CMSampleBuffer, _ty| {
+                    let mut slot = anchor.lock();
+                    if slot.is_none() {
+                        let t = sample.presentation_timestamp();
+                        if t.timescale != 0 {
+                            *slot = Some(t.value as f64 / t.timescale as f64);
+                        }
+                    }
+                },
+                SCStreamOutputType::Screen,
+            );
+        }
+        if wants_system {
+            let tap = AudioTap::new(
+                segment_path.with_extension("system.wav"),
+                Arc::clone(&video_anchor),
+            );
+            stream.add_output_handler(tap.handler(), SCStreamOutputType::Audio);
+            system_tap = Some(tap);
+        }
+        if wants_mic {
+            let tap = AudioTap::new(
+                segment_path.with_extension("mic.wav"),
+                Arc::clone(&video_anchor),
+            );
+            stream.add_output_handler(tap.handler(), SCStreamOutputType::Microphone);
+            mic_tap = Some(tap);
+        }
+    }
+
     stream
         .start_capture()
         .map_err(|e| format!("start_capture failed: {e:?}"))?;
@@ -654,6 +722,8 @@ fn build_and_start_segment(
         stream,
         _recording_output: rec_output,
         segment_path: segment_path.to_path_buf(),
+        system_tap,
+        mic_tap,
         stop_emitted,
     })
 }
@@ -676,8 +746,27 @@ fn start_capture(
     // Pixel dimensions for the fallback DisplayInfo below.
     let (fallback_w, fallback_h) = (1920u32, 1080u32);
 
+    // Camera first: it has the slower warm-up and the clearer failure modes
+    // (TCC denial, device unplugged). Nothing else is running yet, so a
+    // camera error aborts cleanly.
+    let camera_rec = match args.camera_device_id.as_deref() {
+        Some(device_id) => Some(camera::CameraRecorder::start(
+            device_id,
+            final_output.with_extension("camera.mov"),
+        )?),
+        None => None,
+    };
+
     let first_segment = segment_path(&id, 0);
-    let segment = build_and_start_segment(&app, &args, &first_segment)?;
+    let segment = match build_and_start_segment(&app, &args, &first_segment) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(cam) = camera_rec {
+                cam.discard();
+            }
+            return Err(e);
+        }
+    };
 
     let started = Instant::now();
     let started_epoch_ms = chrono::Local::now().timestamp_millis();
@@ -760,6 +849,9 @@ fn start_capture(
         args,
         active: Some(segment),
         segments: Vec::new(),
+        system_segments: Vec::new(),
+        mic_segments: Vec::new(),
+        camera: camera_rec,
         final_output,
         cursor_track,
         cursor_stop,
@@ -958,19 +1050,40 @@ fn start_capture(
     Err("Screen capture is only implemented on macOS.".into())
 }
 
+/// Push a finished segment's files onto the recording's segment lists,
+/// finalizing the audio taps so their WAV headers are valid on disk.
+#[cfg(target_os = "macos")]
+fn collect_segment(rec: &mut ActiveRecording, seg: SegmentRecorder) {
+    if let Some(tap) = &seg.system_tap {
+        if let Some(p) = tap.finalize() {
+            rec.system_segments.push(p);
+        }
+    }
+    if let Some(tap) = &seg.mic_tap {
+        if let Some(p) = tap.finalize() {
+            rec.mic_segments.push(p);
+        }
+    }
+    rec.segments.push(seg.segment_path.clone());
+}
+
 /// Stop the active segment (if any) and push its file onto `segments`.
 /// Sets `stop_emitted` first so the SCK delegate's on_stop fires silently.
 #[cfg(target_os = "macos")]
 fn stop_active_segment(rec: &mut ActiveRecording) -> Result<(), String> {
     if let Some(seg) = rec.active.take() {
         seg.stop_emitted.store(true, Ordering::SeqCst);
-        seg.stream
+        let stop_result = seg
+            .stream
             .stop_capture()
-            .map_err(|e| format!("stop_capture failed: {e:?}"))?;
+            .map_err(|e| format!("stop_capture failed: {e:?}"));
         // SCRecordingOutput finalises the moov atom asynchronously after stop;
         // give it a beat so the segment file is playable when concatenated.
         std::thread::sleep(Duration::from_millis(400));
-        rec.segments.push(seg.segment_path);
+        // Collect even when stop failed: the taps must be finalized either
+        // way or their WAVs are left with invalid headers.
+        collect_segment(rec, seg);
+        stop_result?;
     }
     Ok(())
 }
@@ -1063,7 +1176,31 @@ fn finalize_recording(mut rec: ActiveRecording) -> Result<CaptureArtifact, Strin
 
     let (samples, clicks, cursor_shapes) = drain_cursor_track(&mut rec);
 
+    // Always shut the camera session down — even if the concat below fails,
+    // the camera light must turn off.
+    let camera_result = rec.camera.take().map(|cam| cam.stop());
+    let (camera_path, camera_offset_ms) = match camera_result {
+        Some(Ok((path, camera_epoch))) => {
+            let offset = camera_epoch.map(|e| e - rec.cursor_track.started_epoch_ms);
+            (Some(path.to_string_lossy().to_string()), offset)
+        }
+        Some(Err(e)) => {
+            eprintln!("[camera] finalize failed: {e}");
+            (None, None)
+        }
+        None => (None, None),
+    };
+
     concat_segments(&rec.segments, &rec.final_output)?;
+
+    let system_audio_path = concat_wav_segments(
+        &rec.system_segments,
+        &rec.final_output.with_extension("system.wav"),
+    );
+    let mic_path = concat_wav_segments(
+        &rec.mic_segments,
+        &rec.final_output.with_extension("mic.wav"),
+    );
 
     let sidecar = CursorSidecar {
         version: 2,
@@ -1096,6 +1233,10 @@ fn finalize_recording(mut rec: ActiveRecording) -> Result<CaptureArtifact, Strin
         id: rec.id,
         path: rec.final_output.to_string_lossy().to_string(),
         duration_ms,
+        system_audio_path: system_audio_path.map(|p| p.to_string_lossy().to_string()),
+        mic_path: mic_path.map(|p| p.to_string_lossy().to_string()),
+        camera_path,
+        camera_offset_ms,
     })
 }
 
@@ -1103,14 +1244,25 @@ fn finalize_recording(mut rec: ActiveRecording) -> Result<CaptureArtifact, Strin
 /// threads, and delete every segment file plus any sidecar that was written.
 #[cfg(target_os = "macos")]
 fn discard_recording(mut rec: ActiveRecording) {
+    if let Some(cam) = rec.camera.take() {
+        cam.discard();
+    }
     let _ = stop_active_segment(&mut rec);
     let _ = drain_cursor_track(&mut rec);
-    for seg in &rec.segments {
+    for seg in rec
+        .segments
+        .iter()
+        .chain(&rec.system_segments)
+        .chain(&rec.mic_segments)
+    {
         let _ = std::fs::remove_file(seg);
     }
-    // The final output isn't written yet (concat hasn't run), but a stale
-    // sidecar from a prior run could collide; clean it up to be safe.
+    // The final output isn't written yet (concat hasn't run), but stale
+    // sidecars from a prior run could collide; clean them up to be safe.
     let _ = std::fs::remove_file(rec.final_output.with_extension("cursor.json"));
+    let _ = std::fs::remove_file(rec.final_output.with_extension("system.wav"));
+    let _ = std::fs::remove_file(rec.final_output.with_extension("mic.wav"));
+    let _ = std::fs::remove_file(rec.final_output.with_extension("camera.mov"));
 }
 
 #[cfg(target_os = "macos")]
@@ -1140,7 +1292,7 @@ fn finalize_external_stop(state: State<'_, RecordingState>) -> Result<CaptureArt
     // `stop_active_segment` (which would try to stop a dead stream).
     if let Some(seg) = rec.active.take() {
         std::thread::sleep(Duration::from_millis(400));
-        rec.segments.push(seg.segment_path);
+        collect_segment(&mut rec, seg);
     }
     finalize_recording(rec)
 }
@@ -1162,6 +1314,9 @@ fn pause_capture(state: State<'_, RecordingState>) -> Result<(), String> {
             .fetch_add(elapsed, Ordering::Relaxed);
         rec.cursor_track.paused.store(true, Ordering::Relaxed);
     }
+    if let Some(cam) = &rec.camera {
+        cam.pause();
+    }
     stop_active_segment(rec)
 }
 
@@ -1180,6 +1335,9 @@ fn resume_capture(
     let path = segment_path(&rec.id, next_idx);
     let segment = build_and_start_segment(&app, &rec.args, &path)?;
     rec.active = Some(segment);
+    if let Some(cam) = &rec.camera {
+        cam.resume();
+    }
     // Reset the per-segment clock anchor and clear `paused` only after the
     // new stream is up so we don't push cursor samples into a dead segment.
     *rec.cursor_track.started.lock() = Instant::now();
@@ -2049,6 +2207,10 @@ fn open_dev_editor(app: AppHandle, tracker: State<'_, PickerTrackerState>) -> Re
         id: "dev-fixture".into(),
         path: path.to_string_lossy().to_string(),
         duration_ms,
+        system_audio_path: None,
+        mic_path: None,
+        camera_path: None,
+        camera_offset_ms: None,
     };
     open_editor_with_artifact(app, artifact)
 }
@@ -2318,16 +2480,76 @@ fn present_editor(app: AppHandle) -> Result<(), String> {
 // original recording, trimmed to the exported range.
 // ---------------------------------------------------------------------------
 
+/// The long-lived ffmpeg encoder for raw-RGBA streaming exports: frames are
+/// piped straight into its stdin (no PNG round-trip) and it encodes the
+/// video-only mp4 concurrently with the webview's compositing.
+struct ExportEncoder {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    video_path: PathBuf,
+}
+
 struct ExportSession {
     dir: PathBuf,
     fps: u32,
     format: String,
     preset: String,
+    width: u32,
+    height: u32,
     canceled: Arc<AtomicBool>,
+    encoder: Option<ExportEncoder>,
 }
 
 static EXPORT_SESSIONS: Lazy<Mutex<HashMap<String, ExportSession>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Whether the bundled ffmpeg has the macOS hardware H.264 encoder.
+static VIDEOTOOLBOX_AVAILABLE: Lazy<bool> = Lazy::new(|| {
+    Command::new(ffmpeg_path())
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_videotoolbox"))
+        .unwrap_or(false)
+});
+
+/// H.264 encoder args: VideoToolbox (hardware) with a per-preset bitrate
+/// ladder when available, otherwise the previous libx264 CRF settings.
+/// VideoToolbox is rate-controlled (no CRF), so quality tiers map to the
+/// same Mbps table the frontend uses for its size estimate.
+fn mp4_video_args(preset: &str, height: u32) -> Vec<String> {
+    if *VIDEOTOOLBOX_AVAILABLE {
+        let tier = if height <= 720 {
+            0
+        } else if height <= 1080 {
+            1
+        } else {
+            2
+        };
+        let mbps: [f32; 3] = match preset {
+            "studio" => [8.0, 16.0, 50.0],
+            "social" => [5.0, 10.0, 32.0],
+            "web" => [2.5, 5.0, 18.0],
+            _ => [1.0, 2.0, 8.0], // weblow
+        };
+        vec![
+            "-c:v".into(),
+            "h264_videotoolbox".into(),
+            "-b:v".into(),
+            format!("{}k", (mbps[tier] * 1000.0) as u32),
+            "-profile:v".into(),
+            "high".into(),
+            // Fall back to Apple's software encoder if the hw one declines.
+            "-allow_sw".into(),
+            "1".into(),
+        ]
+    } else {
+        let mut v: Vec<String> = vec!["-c:v".into(), "libx264".into()];
+        for a in x264_args(preset) {
+            v.push(a.into());
+        }
+        v
+    }
+}
 
 #[tauri::command]
 fn export_begin(
@@ -2336,11 +2558,58 @@ fn export_begin(
     fps: u32,
     format: String,
     preset: String,
+    raw: Option<bool>,
 ) -> Result<String, String> {
-    let _ = (width, height); // dimensions are baked into the PNG frames
     let id = uuid::Uuid::new_v4().to_string();
     let dir = std::env::temp_dir().join(format!("osstudio-export-{id}"));
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // Raw streaming mode (GPU-composited mp4 exports): spawn ffmpeg now and
+    // feed it RGBA frames as they arrive. Frames come out of WebGL bottom-up,
+    // hence the vflip.
+    let encoder = if raw.unwrap_or(false) && format == "mp4" {
+        let video_path = dir.join("video.mp4");
+        let mut args: Vec<String> = vec![
+            "-y".into(),
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-f".into(),
+            "rawvideo".into(),
+            "-pix_fmt".into(),
+            "rgba".into(),
+            "-s".into(),
+            format!("{width}x{height}"),
+            "-r".into(),
+            fps.to_string(),
+            "-i".into(),
+            "pipe:0".into(),
+            "-vf".into(),
+            "vflip".into(),
+        ];
+        args.extend(mp4_video_args(&preset, height));
+        args.push("-pix_fmt".into());
+        args.push("yuv420p".into());
+        args.push("-movflags".into());
+        args.push("+faststart".into());
+        args.push(video_path.to_string_lossy().to_string());
+        let mut child = Command::new(ffmpeg_path())
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn ffmpeg encoder: {e}"))?;
+        let stdin = child.stdin.take();
+        Some(ExportEncoder {
+            child,
+            stdin,
+            video_path,
+        })
+    } else {
+        None
+    };
+
     EXPORT_SESSIONS.lock().insert(
         id.clone(),
         ExportSession {
@@ -2348,7 +2617,10 @@ fn export_begin(
             fps,
             format,
             preset,
+            width,
+            height,
             canceled: Arc::new(AtomicBool::new(false)),
+            encoder,
         },
     );
     Ok(id)
@@ -2373,15 +2645,29 @@ fn export_frame(request: tauri::ipc::Request) -> Result<(), String> {
         tauri::ipc::InvokeBody::Raw(b) => b,
         _ => return Err("export_frame expects a raw body".into()),
     };
-    let dir = {
-        let map = EXPORT_SESSIONS.lock();
-        let s = map.get(&session).ok_or("unknown export session")?;
-        if s.canceled.load(Ordering::Relaxed) {
-            return Err("export canceled".into());
+    let mut map = EXPORT_SESSIONS.lock();
+    let s = map.get_mut(&session).ok_or("unknown export session")?;
+    if s.canceled.load(Ordering::Relaxed) {
+        return Err("export canceled".into());
+    }
+    if let Some(enc) = s.encoder.as_mut() {
+        // Raw RGBA streaming: frames arrive strictly in order (the exporter
+        // awaits each send), so piping is equivalent to the indexed files.
+        let expected = (s.width as usize) * (s.height as usize) * 4;
+        if bytes.len() != expected {
+            return Err(format!(
+                "raw frame {index} has {} bytes, expected {expected}",
+                bytes.len()
+            ));
         }
-        s.dir.clone()
-    };
-    let path = dir.join(format!("{index:06}.png"));
+        let stdin = enc.stdin.as_mut().ok_or("encoder stdin already closed")?;
+        use std::io::Write;
+        stdin
+            .write_all(bytes)
+            .map_err(|e| format!("ffmpeg encoder rejected frame {index}: {e}"))?;
+        return Ok(());
+    }
+    let path = s.dir.join(format!("{index:06}.png"));
     fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -2472,32 +2758,83 @@ fn run_ffmpeg_with_progress(
     Ok(())
 }
 
+/// One audio source to mix into the export: read `[src_start, src_end]`
+/// seconds from `path`, scale by `gain`, and place it `delay` seconds into
+/// the output timeline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrackSpec {
+    pub path: String,
+    pub src_start: f64,
+    pub src_end: f64,
+    pub delay: f64,
+    pub gain: f64,
+}
+
+/// Append the audio trim/gain/delay filter graph and stream maps. Audio
+/// inputs are assumed to start at ffmpeg input index 1 (input 0 is the
+/// video). Per track: cut its window, rebase timestamps, apply gain, then
+/// delay it to its position in the exported timeline; mix all tracks without
+/// normalization (each keeps its set level).
+fn append_audio_mix_args(args: &mut Vec<String>, audio_tracks: &[AudioTrackSpec]) {
+    let mut fc = String::new();
+    for (i, t) in audio_tracks.iter().enumerate() {
+        let delay_ms = (t.delay.max(0.0) * 1000.0).round() as u64;
+        fc.push_str(&format!(
+            "[{input}:a]atrim=start={s0:.3}:end={s1:.3},asetpts=PTS-STARTPTS,volume={g:.3},adelay={d}:all=1[a{i}];",
+            input = i + 1,
+            s0 = t.src_start.max(0.0),
+            s1 = t.src_end.max(t.src_start),
+            g = t.gain.clamp(0.0, 1.0),
+            d = delay_ms,
+        ));
+    }
+    if audio_tracks.len() == 1 {
+        // Single track: its labeled output is the mix.
+        fc.pop(); // trailing ';'
+        args.push("-filter_complex".into());
+        args.push(fc);
+        args.push("-map".into());
+        args.push("0:v".into());
+        args.push("-map".into());
+        args.push("[a0]".into());
+    } else {
+        for i in 0..audio_tracks.len() {
+            fc.push_str(&format!("[a{i}]"));
+        }
+        fc.push_str(&format!(
+            "amix=inputs={}:duration=longest:normalize=0[aout]",
+            audio_tracks.len()
+        ));
+        args.push("-filter_complex".into());
+        args.push(fc);
+        args.push("-map".into());
+        args.push("0:v".into());
+        args.push("-map".into());
+        args.push("[aout]".into());
+    }
+}
+
 #[tauri::command]
 fn export_finish(
     app: AppHandle,
     session_id: String,
     out_path: String,
-    audio_src: Option<String>,
-    audio_start: f64,
-    audio_end: f64,
+    audio_tracks: Vec<AudioTrackSpec>,
 ) -> Result<String, String> {
-    let (dir, fps, format, preset, canceled) = {
-        let map = EXPORT_SESSIONS.lock();
-        let s = map.get(&session_id).ok_or("unknown export session")?;
+    let (dir, fps, format, preset, height, canceled, encoder) = {
+        let mut map = EXPORT_SESSIONS.lock();
+        let s = map.get_mut(&session_id).ok_or("unknown export session")?;
         (
             s.dir.clone(),
             s.fps,
             s.format.clone(),
             s.preset.clone(),
+            s.height,
             s.canceled.clone(),
+            s.encoder.take(),
         )
     };
-
-    let total = count_frames(&dir);
-    if total == 0 {
-        cleanup_session(&session_id);
-        return Err("no frames were rendered".into());
-    }
 
     // No explicit destination → write into the temp dir (Clipboard target).
     let ext = if format == "gif" { "gif" } else { "mp4" };
@@ -2506,6 +2843,73 @@ fn export_finish(
     } else {
         PathBuf::from(&out_path)
     };
+
+    // Raw streaming path: close the encoder's stdin, let it finish, then mux
+    // audio with a stream-copied video (no re-encode).
+    if let Some(mut enc) = encoder {
+        drop(enc.stdin.take()); // EOF → ffmpeg drains and finalizes the mp4
+        let mut stderr_text = String::new();
+        if let Some(mut se) = enc.child.stderr.take() {
+            use std::io::Read;
+            let _ = se.read_to_string(&mut stderr_text);
+        }
+        let status = enc.child.wait().map_err(|e| e.to_string())?;
+        if canceled.load(Ordering::Relaxed) {
+            cleanup_session(&session_id);
+            return Err("export canceled".into());
+        }
+        if !status.success() {
+            cleanup_session(&session_id);
+            return Err(format!("ffmpeg encoder failed: {}", stderr_text.trim()));
+        }
+        if audio_tracks.is_empty() {
+            if fs::rename(&enc.video_path, &final_path).is_err() {
+                fs::copy(&enc.video_path, &final_path).map_err(|e| e.to_string())?;
+                let _ = fs::remove_file(&enc.video_path);
+            }
+        } else {
+            let mut args: Vec<String> = vec![
+                "-y".into(),
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "error".into(),
+                "-progress".into(),
+                "pipe:1".into(),
+                "-nostats".into(),
+                "-i".into(),
+                enc.video_path.to_string_lossy().to_string(),
+            ];
+            for t in &audio_tracks {
+                args.push("-i".into());
+                args.push(t.path.clone());
+            }
+            append_audio_mix_args(&mut args, &audio_tracks);
+            args.push("-c:v".into());
+            args.push("copy".into());
+            args.push("-c:a".into());
+            args.push("aac".into());
+            args.push("-b:a".into());
+            args.push("192k".into());
+            args.push("-movflags".into());
+            args.push("+faststart".into());
+            args.push(final_path.to_string_lossy().to_string());
+            run_ffmpeg_with_progress(&app, &args, 1, &canceled)?;
+        }
+        let result = final_path.to_string_lossy().to_string();
+        if out_path.is_empty() {
+            // Clipboard target: the temp dir holds the final file — keep it.
+            EXPORT_SESSIONS.lock().remove(&session_id);
+        } else {
+            cleanup_session(&session_id);
+        }
+        return Ok(result);
+    }
+
+    let total = count_frames(&dir);
+    if total == 0 {
+        cleanup_session(&session_id);
+        return Err("no frames were rendered".into());
+    }
 
     let input = dir.join("%06d.png").to_string_lossy().to_string();
     let fps_s = fps.to_string();
@@ -2576,26 +2980,19 @@ fn export_finish(
             "-i".into(),
             input,
         ];
-        let has_audio = audio_src.is_some();
-        if let Some(a) = &audio_src {
-            let dur = (audio_end - audio_start).max(0.0);
-            args.push("-ss".into());
-            args.push(format!("{audio_start}"));
-            args.push("-t".into());
-            args.push(format!("{dur}"));
+        for t in &audio_tracks {
             args.push("-i".into());
-            args.push(a.clone());
+            args.push(t.path.clone());
         }
-        args.push("-map".into());
-        args.push("0:v".into());
+        let has_audio = !audio_tracks.is_empty();
         if has_audio {
+            append_audio_mix_args(&mut args, &audio_tracks);
+        } else {
             args.push("-map".into());
-            args.push("1:a?".into());
+            args.push("0:v".into());
         }
-        args.push("-c:v".into());
-        args.push("libx264".into());
-        for a in x264_args(&preset) {
-            args.push(a.into());
+        for a in mp4_video_args(&preset, height) {
+            args.push(a);
         }
         args.push("-pix_fmt".into());
         args.push("yuv420p".into());
@@ -2606,7 +3003,6 @@ fn export_finish(
             args.push("aac".into());
             args.push("-b:a".into());
             args.push("192k".into());
-            args.push("-shortest".into());
         }
         args.push(final_path.to_string_lossy().to_string());
         run_ffmpeg_with_progress(&app, &args, total, &canceled)?;
@@ -2643,8 +3039,20 @@ fn cleanup_session(session_id: &str) {
 
 #[tauri::command]
 fn export_cancel(session_id: String) {
-    if let Some(s) = EXPORT_SESSIONS.lock().get(&session_id) {
-        s.canceled.store(true, Ordering::Relaxed);
+    let encoder = {
+        let mut map = EXPORT_SESSIONS.lock();
+        match map.get_mut(&session_id) {
+            Some(s) => {
+                s.canceled.store(true, Ordering::Relaxed);
+                s.encoder.take()
+            }
+            None => None,
+        }
+    };
+    if let Some(mut enc) = encoder {
+        drop(enc.stdin.take());
+        let _ = enc.child.kill();
+        let _ = enc.child.wait();
     }
     cleanup_session(&session_id);
 }
@@ -2926,6 +3334,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_capture_sources,
+            request_camera_access,
             start_capture,
             stop_capture,
             finalize_external_stop,

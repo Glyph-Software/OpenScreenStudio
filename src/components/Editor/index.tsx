@@ -17,14 +17,62 @@ import {
   type ZoomSegment,
 } from "../../lib/autoZoom";
 import {
+  cameraAt,
   computeFrameLayout,
   computeZoomTransform,
   cursorPosAt,
   cursorShapeAt,
   glyphFor,
   isWallpaperImage,
+  makeCursorRenderState,
+  type CameraKeyframe,
+  type RenderFrameOpts,
 } from "../../lib/compositor";
+import { GLCompositor, rasterizeGlyphsGL } from "../../lib/compositorGL";
 import { ExportDialog } from "./ExportDialog";
+
+/**
+ * Upgrade an asset-protocol URL to a same-origin blob: URL. WKWebView treats
+ * the Tauri asset protocol as cross-origin, which blocks uploading the
+ * <video> to a WebGL texture (the GPU preview path). While the fetch is in
+ * flight — or if it fails / the file is enormous — the original URL is
+ * returned and the preview falls back to the DOM compositor.
+ */
+const BLOB_PREVIEW_MAX_BYTES = 1_500_000_000;
+function useSameOriginSrc(url: string | null): string | null {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!url || url.startsWith("blob:")) {
+      setBlobUrl(null);
+      return;
+    }
+    let alive = true;
+    let created: string | null = null;
+    setBlobUrl(null);
+    (async () => {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const len = Number(res.headers.get("content-length") || 0);
+        if (len > BLOB_PREVIEW_MAX_BYTES) {
+          res.body?.cancel();
+          return;
+        }
+        const blob = await res.blob();
+        if (!alive) return;
+        created = URL.createObjectURL(blob);
+        setBlobUrl(created);
+      } catch {
+        /* keep the asset URL */
+      }
+    })();
+    return () => {
+      alive = false;
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [url]);
+  return url ? blobUrl ?? url : null;
+}
 
 type ZoomSettings = {
   autoOn: boolean;
@@ -108,6 +156,59 @@ const GRADIENTS = [
 /** Crop region, normalized 0..1 over the recorded video frame. */
 type CropRect = { x: number; y: number; w: number; h: number };
 
+/**
+ * One editable sidecar audio track (system audio / microphone). Trims are in
+ * seconds on the shared timeline: `trimStart` silences the head of the track,
+ * `trimEnd` silences from the end — the same convention as the clip trim.
+ */
+type AudioTrackState = {
+  muted: boolean;
+  gain: number; // 0..1
+  trimStart: number;
+  trimEnd: number;
+};
+
+type AudioTrackKey = "system" | "mic";
+
+const defaultAudioTrack = (): AudioTrackState => ({
+  muted: false,
+  gain: 1,
+  trimStart: 0,
+  trimEnd: 0,
+});
+
+const defaultAudioTracks = () => ({
+  system: defaultAudioTrack(),
+  mic: defaultAudioTrack(),
+});
+
+/**
+ * Camera bubble settings. `pos` is the bubble center normalized 0..1 over
+ * the output frame; `size` is the bubble edge as a fraction of frame width.
+ * Frame space, not video space — the bubble ignores auto-zoom.
+ *
+ * With `keyframes` set, position/size animate between them over the timeline
+ * (see `cameraAt` in lib/compositor); `pos`/`size` then only serve as the
+ * fallback once keyframes are cleared.
+ */
+type CameraState = {
+  enabled: boolean;
+  pos: { x: number; y: number };
+  size: number;
+  shape: "circle" | "rounded";
+  mirrored: boolean;
+  keyframes: CameraKeyframe[];
+};
+
+const defaultCameraState = (): CameraState => ({
+  enabled: true,
+  pos: { x: 0.86, y: 0.82 },
+  size: 0.2,
+  shape: "rounded", // squircle bottom-right by default
+  mirrored: false,
+  keyframes: [],
+});
+
 type EditorState = {
   aspect: AspectKey;
   bgTab: string;
@@ -119,13 +220,15 @@ type EditorState = {
   trimStart: number;
   trimEnd: number;
   splits: number[];
+  audioTracks: Record<AudioTrackKey, AudioTrackState>;
+  camera: CameraState;
 };
 
 const ASPECT_ORDER: AspectKey[] = ["16:9", "1:1", "9:16", "system"];
 
 type StatePatch = Partial<EditorState>;
 
-const PROJECT_VERSION = 1;
+const PROJECT_VERSION = 2;
 
 /** On-disk shape of a `.openscreen` project file. */
 type ProjectFile = {
@@ -151,6 +254,59 @@ async function fetchSidecar(
 }
 
 const baseName = (p: string) => p.split(/[\\/]/).pop() || p;
+
+// One shared AudioContext: decodes the sidecar WAVs for waveforms AND plays
+// them during preview. Sidecar audio plays through Web Audio (not <audio>
+// elements) — buffer playback is format-agnostic once decodeAudioData
+// succeeds, where the media-element pipeline can refuse float32 WAVs.
+let sharedAudioCtx: AudioContext | null = null;
+function getAudioCtx(): AudioContext {
+  if (!sharedAudioCtx) {
+    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    sharedAudioCtx = new Ctx();
+  }
+  return sharedAudioCtx;
+}
+
+/** Decode an audio resource (mp4 soundtrack or sidecar WAV). */
+async function decodeAudioFromUrl(url: string): Promise<AudioBuffer | null> {
+  try {
+    const buf = await fetch(url).then((r) => r.arrayBuffer());
+    return await new Promise((resolve, reject) =>
+      getAudioCtx().decodeAudioData(buf, resolve, reject),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reduce a decoded buffer to `n` normalized peak samples for waveform
+ * rendering. Returns null when the audio is effectively silent.
+ */
+function peaksFromBuffer(audio: AudioBuffer, n = 260): number[] | null {
+  const ch0 = audio.getChannelData(0);
+  const ch1 = audio.numberOfChannels > 1 ? audio.getChannelData(1) : null;
+  const block = Math.max(1, Math.floor(ch0.length / n));
+  const out: number[] = new Array(n);
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    const start = i * block;
+    const end = Math.min(start + block, ch0.length);
+    let m = 0;
+    for (let j = start; j < end; j++) {
+      const a = Math.abs(ch0[j]);
+      if (a > m) m = a;
+      if (ch1) {
+        const b = Math.abs(ch1[j]);
+        if (b > m) m = b;
+      }
+    }
+    out[i] = m;
+    if (m > peak) peak = m;
+  }
+  return peak > 0.001 ? out.map((v) => v / peak) : null;
+}
 
 const THEME_OPTIONS: { value: ThemeMode; label: string }[] = [
   { value: "light", label: "Light" },
@@ -636,7 +792,15 @@ function CursorZoomPanel({
       {!cursorSidecar && (
         <div className="helper-text">Record clicks to enable auto-zoom.</div>
       )}
-      {cursorSidecar && zoomSegments.length === 0 && (
+      {cursorSidecar && cursorSidecar.clicks.length === 0 && (
+        <div className="helper-text" style={{ color: "#e0a050" }}>
+          No clicks were captured in this recording, so auto-zoom has nothing
+          to zoom to. Click tracking needs macOS Accessibility permission:
+          System Settings → Privacy &amp; Security → Accessibility → enable
+          OpenScreen Studio, then record again.
+        </div>
+      )}
+      {cursorSidecar && cursorSidecar.clicks.length > 0 && zoomSegments.length === 0 && (
         <div className="helper-text">No segments yet. Click "Regenerate from clicks" or scrub the timeline.</div>
       )}
       <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
@@ -955,6 +1119,194 @@ function ZoomSegmentPanel({
   );
 }
 
+function AudioPanel({
+  rows,
+  onChange,
+  duration,
+  selectedKey,
+}: {
+  rows: AudioRowInfo[];
+  onChange: (key: AudioTrackKey, patch: Partial<AudioTrackState>) => void;
+  duration: number;
+  selectedKey: AudioTrackKey | null;
+}) {
+  const fmt = (s: number) => `${s.toFixed(1)}s`;
+  return (
+    <div className="section">
+      <h3 className="section-title">
+        <Ico.audio size={15} /> Audio
+      </h3>
+      {rows.length === 0 && (
+        <div className="helper-text">
+          No audio tracks in this recording. Turn on the microphone or system
+          audio pills in the recorder before capturing.
+        </div>
+      )}
+      {rows.map((row, i) => (
+        <div
+          key={row.key}
+          style={{
+            marginTop: i === 0 ? 4 : 22,
+            paddingLeft: 8,
+            borderLeft:
+              selectedKey === row.key
+                ? "2px solid var(--accent, #4f8cff)"
+                : "2px solid transparent",
+          }}
+        >
+          <div className="label-row label-strong">{row.label}</div>
+          <div className="seg">
+            <button
+              className={!row.track.muted ? "on" : ""}
+              onClick={() => onChange(row.key, { muted: false })}
+            >
+              On
+            </button>
+            <button
+              className={row.track.muted ? "on" : ""}
+              onClick={() => onChange(row.key, { muted: true })}
+            >
+              Muted
+            </button>
+          </div>
+          <div className="label-row label-strong" style={{ marginTop: 14 }}>
+            Volume · {Math.round(row.track.gain * 100)}%
+          </div>
+          <Slider
+            value={Math.round(row.track.gain * 100)}
+            onChange={(v) => onChange(row.key, { gain: v / 100 })}
+            min={0}
+            max={100}
+            onReset={() => onChange(row.key, { gain: 1 })}
+          />
+          {(row.track.trimStart > 0 || row.track.trimEnd > 0) && (
+            <div
+              className="helper-text"
+              style={{
+                marginTop: 8,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 8,
+              }}
+            >
+              <span>
+                Plays {fmt(row.track.trimStart)} → {fmt(Math.max(0, duration - row.track.trimEnd))}
+              </span>
+              <button
+                className="reset"
+                onClick={() => onChange(row.key, { trimStart: 0, trimEnd: 0 })}
+              >
+                Reset trim
+              </button>
+            </div>
+          )}
+        </div>
+      ))}
+      {rows.length > 0 && (
+        <div className="helper-text" style={{ marginTop: 18 }}>
+          Drag the handles on an audio row in the timeline to crop where it
+          plays.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CameraPanel({
+  hasCamera,
+  cam,
+  onChange,
+  onAddKeyframe,
+  onClearKeyframes,
+}: {
+  hasCamera: boolean;
+  cam: CameraState;
+  onChange: (p: Partial<CameraState>) => void;
+  onAddKeyframe: () => void;
+  onClearKeyframes: () => void;
+}) {
+  return (
+    <div className="section">
+      <h3 className="section-title">
+        <Ico.webcam size={15} /> Camera
+      </h3>
+      {!hasCamera ? (
+        <div className="helper-text">
+          No camera track in this recording. Turn on the camera pill in the
+          recorder before capturing.
+        </div>
+      ) : (
+        <>
+          <div className="label-row label-strong">Show camera</div>
+          <div className="seg">
+            <button className={cam.enabled ? "on" : ""} onClick={() => onChange({ enabled: true })}>
+              On
+            </button>
+            <button className={!cam.enabled ? "on" : ""} onClick={() => onChange({ enabled: false })}>
+              Off
+            </button>
+          </div>
+
+          <div className="label-row label-strong" style={{ marginTop: 18 }}>
+            Size · {Math.round(cam.size * 100)}%
+          </div>
+          <Slider
+            value={Math.round(cam.size * 100)}
+            onChange={(v) => onChange({ size: Math.min(0.5, Math.max(0.08, v / 100)) })}
+            min={8}
+            max={50}
+            onReset={() => onChange({ size: 0.2 })}
+          />
+
+          <div className="label-row label-strong" style={{ marginTop: 18 }}>
+            Shape
+          </div>
+          <div className="seg">
+            <button className={cam.shape === "circle" ? "on" : ""} onClick={() => onChange({ shape: "circle" })}>
+              Circle
+            </button>
+            <button className={cam.shape === "rounded" ? "on" : ""} onClick={() => onChange({ shape: "rounded" })}>
+              Rounded
+            </button>
+          </div>
+
+          <div className="label-row label-strong" style={{ marginTop: 18 }}>
+            Mirror
+          </div>
+          <div className="seg">
+            <button className={cam.mirrored ? "on" : ""} onClick={() => onChange({ mirrored: true })}>
+              On
+            </button>
+            <button className={!cam.mirrored ? "on" : ""} onClick={() => onChange({ mirrored: false })}>
+              Off
+            </button>
+          </div>
+
+          <div className="label-row label-strong" style={{ marginTop: 18 }}>
+            Position keyframes · {cam.keyframes.length}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+            <button className="reset" onClick={onAddKeyframe}>
+              + Add at playhead
+            </button>
+            {cam.keyframes.length > 0 && (
+              <button className="reset" onClick={onClearKeyframes}>
+                Clear all
+              </button>
+            )}
+          </div>
+          <div className="helper-text" style={{ marginTop: 12 }}>
+            {cam.keyframes.length === 0
+              ? "Drag the camera bubble in the preview to place it; drag its corner handle to resize. Add a keyframe to start animating its position over time."
+              : "With keyframes set, dragging the bubble updates the keyframe at the playhead (a new one is created if none is there). The camera glides between keyframes. On the timeline's camera row: click a diamond to jump to it, ⌥-click to delete it."}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function Inspector({
   active,
   state,
@@ -966,6 +1318,13 @@ function Inspector({
   setZoomSegments,
   selectedSeg,
   videoSrc,
+  audioRows,
+  onAudioTrack,
+  selectedAudioKey,
+  duration,
+  hasCamera,
+  onCameraAddKeyframe,
+  onCameraClearKeyframes,
 }: {
   active: string;
   state: EditorState;
@@ -977,6 +1336,13 @@ function Inspector({
   setZoomSegments: (next: ZoomSegment[]) => void;
   selectedSeg: ZoomSegment | null;
   videoSrc: string;
+  audioRows: AudioRowInfo[];
+  onAudioTrack: (key: AudioTrackKey, patch: Partial<AudioTrackState>) => void;
+  selectedAudioKey: AudioTrackKey | null;
+  duration: number;
+  hasCamera: boolean;
+  onCameraAddKeyframe: () => void;
+  onCameraClearKeyframes: () => void;
 }) {
   return (
     <aside className="inspector">
@@ -997,6 +1363,21 @@ function Inspector({
           zoomSegments={zoomSegments}
           setZoomSegments={setZoomSegments}
         />
+      ) : active === "audio" ? (
+        <AudioPanel
+          rows={audioRows}
+          onChange={onAudioTrack}
+          duration={duration}
+          selectedKey={selectedAudioKey}
+        />
+      ) : active === "webcam" ? (
+        <CameraPanel
+          hasCamera={hasCamera}
+          cam={state.camera}
+          onChange={(p) => set({ camera: { ...state.camera, ...p } })}
+          onAddKeyframe={onCameraAddKeyframe}
+          onClearKeyframes={onCameraClearKeyframes}
+        />
       ) : (
         <BackgroundPanel state={state} set={set} />
       )}
@@ -1014,9 +1395,9 @@ function IconRail({
   const items = [
     { id: "background", icon: <Ico.rect size={17} />, badge: true },
     { id: "cursor", icon: <Ico.cursor size={17} /> },
-    { id: "webcam", icon: <Ico.webcam size={17} />, disabled: true },
+    { id: "webcam", icon: <Ico.webcam size={17} /> },
     { id: "subtitles", icon: <Ico.speech size={17} />, disabled: true },
-    { id: "audio", icon: <Ico.audio size={17} />, disabled: true },
+    { id: "audio", icon: <Ico.audio size={17} /> },
     { id: "shortcuts", icon: <Ico.cmd size={17} />, disabled: true },
     { id: "actions", icon: <Ico.link size={17} />, disabled: true },
   ];
@@ -1041,6 +1422,125 @@ function IconRail({
   );
 }
 
+/**
+ * The draggable/resizable camera bubble. Lives directly in the canvas frame
+ * (frame space) — deliberately outside the zoomed video wrapper, so the
+ * bubble stays put while the screen content zooms. Mirrors `drawCamera` in
+ * lib/compositor, which bakes the same geometry into exports.
+ */
+function CameraOverlay({
+  src,
+  shape,
+  mirrored,
+  eff,
+  frameW,
+  frameH,
+  videoRef,
+  onTransform,
+  onSelect,
+}: {
+  src: string;
+  shape: CameraState["shape"];
+  mirrored: boolean;
+  /** Evaluated position/size at the playhead (keyframe-interpolated). */
+  eff: { pos: { x: number; y: number }; size: number };
+  frameW: number;
+  frameH: number;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  onTransform: (p: { pos?: { x: number; y: number }; size?: number }) => void;
+  onSelect: () => void;
+}) {
+  const box = eff.size * frameW;
+  const left = eff.pos.x * frameW - box / 2;
+  const top = eff.pos.y * frameH - box / 2;
+
+  const clampPos = (x: number, y: number, size: number) => {
+    const halfX = size / 2;
+    const halfY = (size * frameW) / 2 / Math.max(1, frameH);
+    return {
+      x: Math.min(1 - halfX, Math.max(halfX, x)),
+      y: Math.min(1 - halfY, Math.max(halfY, y)),
+    };
+  };
+
+  const beginMove = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onSelect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const start = eff.pos;
+    const move = (ev: PointerEvent) => {
+      const nx = start.x + (ev.clientX - startX) / Math.max(1, frameW);
+      const ny = start.y + (ev.clientY - startY) / Math.max(1, frameH);
+      onTransform({ pos: clampPos(nx, ny, eff.size) });
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  const beginResize = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onSelect();
+    const startX = e.clientX;
+    const startSize = eff.size;
+    const startPos = eff.pos;
+    const move = (ev: PointerEvent) => {
+      const size = Math.min(
+        0.5,
+        Math.max(0.08, startSize + ((ev.clientX - startX) / Math.max(1, frameW)) * 2),
+      );
+      onTransform({ size, pos: clampPos(startPos.x, startPos.y, size) });
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  return (
+    <div
+      className={`camera-overlay ${shape}`}
+      style={{ left, top, width: box, height: box }}
+      onPointerDown={beginMove}
+      title="Drag to move the camera"
+    >
+      <video
+        ref={videoRef}
+        src={src}
+        muted
+        playsInline
+        preload="auto"
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          display: "block",
+          transform: mirrored ? "scaleX(-1)" : undefined,
+          pointerEvents: "none",
+        }}
+      />
+      <div
+        className="camera-resize"
+        onPointerDown={beginResize}
+        title="Drag to resize"
+      />
+    </div>
+  );
+}
+
+/** The GL compositor manages its own glyph textures; opts still want a map. */
+const EMPTY_GLYPHS = new Map<CursorSidecarShapeName, CanvasImageSource>();
+
 function Canvas({
   aspect,
   wallpaper,
@@ -1055,6 +1555,12 @@ function Canvas({
   videoNaturalSize,
   cropRect,
   previewFps,
+  cameraSrc,
+  camera,
+  cameraEff,
+  cameraVideoRef,
+  onCameraTransform,
+  onCameraSelect,
 }: {
   aspect: AspectKey;
   wallpaper: string;
@@ -1069,6 +1575,12 @@ function Canvas({
   videoNaturalSize: { w: number; h: number } | null;
   cropRect: CropRect | null;
   previewFps: number;
+  cameraSrc: string | null;
+  camera: CameraState;
+  cameraEff: { pos: { x: number; y: number }; size: number };
+  cameraVideoRef: React.RefObject<HTMLVideoElement | null>;
+  onCameraTransform: (p: { pos?: { x: number; y: number }; size?: number }) => void;
+  onCameraSelect: () => void;
 }) {
   const a = ASPECTS[aspect];
   // Frame/window geometry is shared with the offline exporter so the preview
@@ -1090,6 +1602,42 @@ function Canvas({
   // this off the render path so 60 Hz updates don't trash the reconciler.
   const videoWrapRef = useRef<HTMLDivElement | null>(null);
   const cursorElRef = useRef<HTMLDivElement | null>(null);
+
+  // GPU preview: the recorded window (video + zoom + motion blur + cursor)
+  // renders on a WebGL canvas via the shared compositor; wallpaper and the
+  // interactive camera overlay stay DOM. Requires a same-origin (blob:)
+  // video source for texture uploads — until then, and whenever GL is
+  // unavailable or errors, the CSS-transform DOM path below still runs.
+  const glCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const glRef = useRef<GLCompositor | null>(null);
+  const glBrokenRef = useRef(false);
+  const cursorStateRef = useRef(makeCursorRenderState());
+  const glSafe = videoSrc.startsWith("blob:");
+  const [glActive, setGlActive] = useState(false);
+  useEffect(() => {
+    if (!glSafe || glBrokenRef.current) return;
+    const cnv = glCanvasRef.current;
+    if (!cnv) return;
+    const glc = GLCompositor.create(cnv);
+    if (!glc) return;
+    let alive = true;
+    rasterizeGlyphsGL()
+      .then((g) => {
+        if (alive) glc.setGlyphs(g);
+      })
+      .catch(() => {
+        /* cursor just won't draw on the GL canvas */
+      });
+    glRef.current = glc;
+    setGlActive(true);
+    return () => {
+      alive = false;
+      glRef.current = null;
+      glc.dispose();
+      setGlActive(false);
+    };
+  }, [glSafe]);
+
   useEffect(() => {
     const wrap = videoWrapRef.current;
     const video = videoRef.current;
@@ -1211,6 +1759,108 @@ function Canvas({
       wrap.style.transformOrigin = "0 0";
       wrap.style.transform = `translate(${zt.tx}px, ${zt.ty}px) scale(${zt.scale})`;
     };
+    // --- GPU branch: render the recorded window with the shared compositor.
+    // Skips redraws while nothing changed (static playhead + decoded frame),
+    // so an idle paused editor does no GPU work.
+    const useGl = glActive && !glBrokenRef.current;
+    let glDirty = true;
+    let lastDrawnTMs = -1;
+    let lastDrawMs = performance.now();
+    let lastOutW = 0;
+    let lastOutH = 0;
+    const markDirty = () => {
+      glDirty = true;
+    };
+    let rvfcId: number | null = null;
+    const anyVideo = video as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number;
+      cancelVideoFrameCallback?: (id: number) => void;
+    };
+    if (useGl) {
+      // Neutralize the DOM path's leftovers: the canvas owns zoom + cursor.
+      wrap.style.transform = "";
+      if (cursorElRef.current) cursorElRef.current.style.display = "none";
+      cursorStateRef.current.has = false;
+      video.addEventListener("seeked", markDirty);
+      if (typeof anyVideo.requestVideoFrameCallback === "function") {
+        const loop = () => {
+          markDirty();
+          rvfcId = anyVideo.requestVideoFrameCallback!(loop);
+        };
+        rvfcId = anyVideo.requestVideoFrameCallback(loop);
+      }
+    }
+    const glDraw = (nowMs: number) => {
+      const glc = glRef.current;
+      const cnv = glCanvasRef.current;
+      if (!glc || !cnv) return;
+      const wrapW = wrap.offsetWidth;
+      const wrapH = wrap.offsetHeight;
+      if (wrapW < 1 || wrapH < 1 || video.readyState < 2) return;
+      const dpr = window.devicePixelRatio || 1;
+      const outW = Math.max(1, Math.round(wrapW * dpr));
+      const outH = Math.max(1, Math.round(wrapH * dpr));
+      const tMs = video.currentTime * 1000;
+      if (
+        !glDirty &&
+        tMs === lastDrawnTMs &&
+        outW === lastOutW &&
+        outH === lastOutH
+      ) {
+        return;
+      }
+      const dtSec = Math.min(1 / 15, Math.max(0, (nowMs - lastDrawMs) / 1000));
+      lastDrawMs = nowMs;
+      // The canvas spans only the recorded window, so synthesize a layout
+      // whose frame *is* the wrap box (no padding, no wrap offset).
+      const o: RenderFrameOpts = {
+        layout: {
+          w: wrapW,
+          h: wrapH,
+          ratio: wrapW / Math.max(1, wrapH),
+          padding: 0,
+          innerW: wrapW,
+          innerH: wrapH,
+          wrapW,
+          wrapH,
+          wrapX: 0,
+          wrapY: 0,
+        },
+        s: dpr,
+        outW,
+        outH,
+        videoSource: video,
+        videoNaturalSize: {
+          w: video.videoWidth || 1,
+          h: video.videoHeight || 1,
+        },
+        wallpaper: "",
+        wallpaperImg: null,
+        blur: 0,
+        cropRect,
+        cursorSidecar,
+        zoomSegments,
+        zoomEnabled: zoomSettings.autoOn,
+        smoothing,
+        timeMs: tMs,
+        glyphImages: EMPTY_GLYPHS,
+        cursorState: cursorStateRef.current,
+        dtSec,
+        camera: null,
+      };
+      try {
+        glc.render(o, { drawWallpaper: false, drawCamera: false });
+        glDirty = false;
+        lastDrawnTMs = tMs;
+        lastOutW = outW;
+        lastOutH = outH;
+      } catch {
+        // Cross-origin/driver failure: permanently fall back to the DOM path.
+        glBrokenRef.current = true;
+        setGlActive(false);
+      }
+    };
+
     // previewFps === 0 means uncapped (full refresh rate). Otherwise throttle
     // the transform loop to the target interval to cut CPU/GPU usage.
     const frameInterval = previewFps > 0 ? 1000 / previewFps : 0;
@@ -1218,14 +1868,34 @@ function Canvas({
     const tick = (now: number) => {
       if (frameInterval === 0 || now - lastFrame >= frameInterval) {
         lastFrame = now;
-        apply();
-        positionCursor();
+        if (useGl && !glBrokenRef.current) {
+          glDraw(now);
+        } else {
+          apply();
+          positionCursor();
+        }
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [videoRef, cursorSidecar, zoomSegments, zoomSettings, cropRect, previewFps]);
+    return () => {
+      cancelAnimationFrame(raf);
+      if (useGl) {
+        video.removeEventListener("seeked", markDirty);
+        if (rvfcId !== null && anyVideo.cancelVideoFrameCallback) {
+          anyVideo.cancelVideoFrameCallback(rvfcId);
+        }
+      }
+    };
+  }, [
+    videoRef,
+    cursorSidecar,
+    zoomSegments,
+    zoomSettings,
+    cropRect,
+    previewFps,
+    glActive,
+  ]);
 
   const wallpaperIsImage = isWallpaperImage(wallpaper);
   return (
@@ -1269,21 +1939,41 @@ function Canvas({
             <video
               ref={videoRef}
               src={videoSrc}
-              style={
-                cropRect
+              style={{
+                ...(cropRect
                   ? {
-                      position: "absolute",
+                      position: "absolute" as const,
                       width: `${100 / cropRect.w}%`,
                       height: `${100 / cropRect.h}%`,
                       left: `${-(cropRect.x / cropRect.w) * 100}%`,
                       top: `${-(cropRect.y / cropRect.h) * 100}%`,
                       display: "block",
-                      objectFit: "contain",
+                      objectFit: "contain" as const,
                     }
-                  : { width: "100%", height: "100%", display: "block", objectFit: "contain" }
-              }
+                  : {
+                      width: "100%",
+                      height: "100%",
+                      display: "block",
+                      objectFit: "contain" as const,
+                    }),
+                // GL mode draws the video on the canvas; keep the element
+                // alive (it is the texture source + audio clock), just unseen.
+                ...(glActive ? { opacity: 0 } : {}),
+              }}
               playsInline
               preload="metadata"
+            />
+            <canvas
+              ref={glCanvasRef}
+              aria-hidden
+              style={{
+                position: "absolute",
+                inset: 0,
+                width: "100%",
+                height: "100%",
+                display: glActive ? "block" : "none",
+                pointerEvents: "none",
+              }}
             />
             <div
               ref={cursorElRef}
@@ -1302,6 +1992,19 @@ function Canvas({
           </div>
         </div>
       </div>
+      {cameraSrc && camera.enabled && (
+        <CameraOverlay
+          src={cameraSrc}
+          shape={camera.shape}
+          mirrored={camera.mirrored}
+          eff={cameraEff}
+          frameW={w}
+          frameH={h}
+          videoRef={cameraVideoRef}
+          onTransform={onCameraTransform}
+          onSelect={onCameraSelect}
+        />
+      )}
     </div>
   );
 }
@@ -1368,6 +2071,11 @@ function Viewport({
   zoomSettings,
   videoNaturalSize,
   previewFps,
+  cameraSrc,
+  cameraEff,
+  cameraVideoRef,
+  onCameraTransform,
+  onCameraSelect,
 }: {
   state: EditorState;
   set: (p: StatePatch) => void;
@@ -1384,6 +2092,11 @@ function Viewport({
   zoomSettings: ZoomSettings;
   videoNaturalSize: { w: number; h: number } | null;
   previewFps: number;
+  cameraSrc: string | null;
+  cameraEff: { pos: { x: number; y: number }; size: number };
+  cameraVideoRef: React.RefObject<HTMLVideoElement | null>;
+  onCameraTransform: (p: { pos?: { x: number; y: number }; size?: number }) => void;
+  onCameraSelect: () => void;
 }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ w: 1000, h: 540 });
@@ -1425,6 +2138,12 @@ function Viewport({
         videoNaturalSize={videoNaturalSize}
         cropRect={state.cropRect}
         previewFps={previewFps}
+        cameraSrc={cameraSrc}
+        camera={state.camera}
+        cameraEff={cameraEff}
+        cameraVideoRef={cameraVideoRef}
+        onCameraTransform={onCameraTransform}
+        onCameraSelect={onCameraSelect}
       />
       <div className="viewport-bottombar">
         <div className="left">
@@ -1632,6 +2351,121 @@ function ZoomChip({
   );
 }
 
+/** Descriptor for one sidecar audio row shown in the timeline. */
+type AudioRowInfo = {
+  key: AudioTrackKey;
+  label: string;
+  peaks: number[] | null;
+  track: AudioTrackState;
+};
+
+const AUDIO_ROW_H = 36;
+
+function AudioTrackRow({
+  info,
+  total,
+  selected,
+  onSelect,
+  onChange,
+}: {
+  info: AudioRowInfo;
+  total: number;
+  selected: boolean;
+  onSelect: () => void;
+  onChange: (patch: Partial<AudioTrackState>) => void;
+}) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const { track } = info;
+
+  // Drag a trim handle: clientX → timeline seconds via the row's box. The
+  // opposite edge is frozen for the duration of the drag, so capturing the
+  // track state at mousedown is safe.
+  const beginTrimDrag = (side: "start" | "end") => (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onSelect();
+    const row = rowRef.current;
+    if (!row) return;
+    const r = row.getBoundingClientRect();
+    const MIN_GAP = 0.05;
+    const move = (ev: MouseEvent) => {
+      const frac = Math.max(0, Math.min(1, (ev.clientX - r.left) / Math.max(1, r.width)));
+      const t = frac * total;
+      if (side === "start") {
+        onChange({ trimStart: Math.max(0, Math.min(t, total - track.trimEnd - MIN_GAP)) });
+      } else {
+        onChange({ trimEnd: Math.max(0, Math.min(total - t, total - track.trimStart - MIN_GAP)) });
+      }
+    };
+    move(e.nativeEvent);
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+
+  const startPct = (track.trimStart / total) * 100;
+  const endPct = ((total - track.trimEnd) / total) * 100;
+
+  return (
+    <div
+      ref={rowRef}
+      className={`tl-track audio ${selected ? "selected" : ""}`}
+      style={{ position: "relative" }}
+      onClick={onSelect}
+    >
+      <div className={`audio-block ${info.key} ${track.muted ? "muted" : ""}`}>
+        {info.peaks && info.peaks.length > 0 ? (
+          <svg
+            className="waveform"
+            viewBox={`0 0 ${info.peaks.length} ${AUDIO_ROW_H}`}
+            preserveAspectRatio="none"
+            style={{ width: "100%" }}
+          >
+            <path d={buildWavePath(info.peaks, AUDIO_ROW_H)} fill="rgba(255,255,255,0.6)" />
+          </svg>
+        ) : (
+          <div className="audio-silent">silence</div>
+        )}
+        {track.trimStart > 0 && (
+          <div className="audio-trim-shade" style={{ left: 0, width: `${startPct}%` }} />
+        )}
+        {track.trimEnd > 0 && (
+          <div className="audio-trim-shade" style={{ right: 0, width: `${100 - endPct}%` }} />
+        )}
+        <button
+          className="audio-mute"
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onChange({ muted: !track.muted });
+            onSelect();
+          }}
+          title={track.muted ? "Unmute track" : "Mute track"}
+        >
+          {track.muted ? <Ico.audioMuted size={11} /> : <Ico.audio size={11} />}
+          <span>{info.label}</span>
+        </button>
+        <div
+          className="audio-trim-handle"
+          style={{ left: `calc(${startPct}% - 4px)` }}
+          onMouseDown={beginTrimDrag("start")}
+          title="Trim track start"
+        />
+        <div
+          className="audio-trim-handle"
+          style={{ left: `calc(${endPct}% - 4px)` }}
+          onMouseDown={beginTrimDrag("end")}
+          title="Trim track end"
+        />
+      </div>
+    </div>
+  );
+}
+
 function Timeline({
   duration,
   currentTime,
@@ -1645,6 +2479,13 @@ function Timeline({
   setZoom,
   playing,
   audioPeaks,
+  audioRows,
+  onAudioTrack,
+  selectedAudioKey,
+  setSelectedAudioKey,
+  cameraRow,
+  onSelectCamera,
+  onRemoveCameraKeyframe,
   zoomSegments,
   setZoomSegments,
   cursorSidecar,
@@ -1664,6 +2505,18 @@ function Timeline({
   setZoom: (v: number) => void;
   playing: boolean;
   audioPeaks: number[] | null;
+  audioRows: AudioRowInfo[];
+  onAudioTrack: (key: AudioTrackKey, patch: Partial<AudioTrackState>) => void;
+  selectedAudioKey: AudioTrackKey | null;
+  setSelectedAudioKey: (key: AudioTrackKey | null) => void;
+  cameraRow: {
+    offset: number;
+    duration: number;
+    keyframes: CameraKeyframe[];
+    enabled: boolean;
+  } | null;
+  onSelectCamera: () => void;
+  onRemoveCameraKeyframe: (t: number) => void;
   zoomSegments: ZoomSegment[];
   setZoomSegments: (next: ZoomSegment[]) => void;
   cursorSidecar: CursorSidecar | null;
@@ -1934,6 +2787,16 @@ function Timeline({
           <div className="tl-gutter-row clip">
             <Ico.film size={12} />
           </div>
+          {cameraRow && (
+            <div className="tl-gutter-row camera">
+              <Ico.webcam size={12} />
+            </div>
+          )}
+          {audioRows.map((row) => (
+            <div key={row.key} className="tl-gutter-row audio">
+              {row.track.muted ? <Ico.audioMuted size={12} /> : <Ico.audio size={12} />}
+            </div>
+          ))}
           <div className="tl-gutter-row zoom">
             <Ico.zoomIn size={12} />
           </div>
@@ -2071,6 +2934,63 @@ function Timeline({
             </div>
           </div>
         </div>
+
+        {cameraRow && (() => {
+          // Camera clip span on the shared timeline (clamped). A zero
+          // duration (metadata not loaded yet / bubble hidden) falls back to
+          // the full remaining range so the row never vanishes.
+          const start = Math.max(0, Math.min(TOTAL, cameraRow.offset));
+          const rawEnd = cameraRow.duration > 0 ? cameraRow.offset + cameraRow.duration : TOTAL;
+          const end = Math.max(start, Math.min(TOTAL, rawEnd));
+          return (
+            <div className="tl-track camera" style={{ position: "relative" }}>
+              <div
+                className={`camera-track-block ${cameraRow.enabled ? "" : "off"}`}
+                style={{
+                  left: `${(start / TOTAL) * 100}%`,
+                  width: `${(Math.max(0.01, end - start) / TOTAL) * 100}%`,
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelectCamera();
+                }}
+                title={cameraRow.enabled ? "Camera track" : "Camera hidden"}
+              >
+                <Ico.webcam size={11} />
+                <span>Camera</span>
+              </div>
+              {cameraRow.keyframes.map((kf) => (
+                <div
+                  key={kf.t}
+                  className="camera-kf"
+                  style={{ left: `${(Math.min(TOTAL, Math.max(0, kf.t)) / TOTAL) * 100}%` }}
+                  title="Position keyframe — click to jump, ⌥-click to delete"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (e.altKey) {
+                      onRemoveCameraKeyframe(kf.t);
+                    } else {
+                      setCurrentTime(kf.t);
+                      onSelectCamera();
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          );
+        })()}
+
+        {audioRows.map((row) => (
+          <AudioTrackRow
+            key={row.key}
+            info={row}
+            total={TOTAL}
+            selected={selectedAudioKey === row.key}
+            onSelect={() => setSelectedAudioKey(row.key)}
+            onChange={(patch) => onAudioTrack(row.key, patch)}
+          />
+        ))}
 
         <div
           className="tl-track zoom"
@@ -2371,14 +3291,27 @@ export function Editor({
     trimStart: 0,
     trimEnd: 0,
     splits: [],
+    audioTracks: defaultAudioTracks(),
+    camera: defaultCameraState(),
   });
   const set = (patch: StatePatch) => setState((s) => ({ ...s, ...patch }));
+  const setAudioTrack = (key: AudioTrackKey, patch: Partial<AudioTrackState>) =>
+    setState((s) => ({
+      ...s,
+      audioTracks: {
+        ...s.audioTracks,
+        [key]: { ...s.audioTracks[key], ...patch },
+      },
+    }));
 
   const [activeRail, setActiveRail] = useState("background");
   const [artifact, setArtifact] = useState<CaptureArtifact | null>(null);
   const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [videoNaturalSize, setVideoNaturalSize] = useState<{ w: number; h: number } | null>(null);
   const [audioPeaks, setAudioPeaks] = useState<number[] | null>(null);
+  const [systemPeaks, setSystemPeaks] = useState<number[] | null>(null);
+  const [micPeaks, setMicPeaks] = useState<number[] | null>(null);
+  const [selectedAudioKey, setSelectedAudioKey] = useState<AudioTrackKey | null>(null);
   const [cursorSidecar, setCursorSidecar] = useState<CursorSidecar | null>(null);
   const [zoomSettings, setZoomSettingsRaw] = useState<ZoomSettings>(DEFAULT_ZOOM_SETTINGS);
   const setZoomSettings = (patch: Partial<ZoomSettings>) =>
@@ -2557,10 +3490,30 @@ export function Editor({
     document.title = projectName;
   }, [projectName]);
 
-  const videoSrc = useMemo(
+  const assetVideoSrc = useMemo(
     () => (artifact ? convertFileSrc(artifact.path) : SAMPLE_VIDEO),
     [artifact],
   );
+  // blob: upgrade enables the WebGL preview (same-origin video textures).
+  const videoSrc = useSameOriginSrc(assetVideoSrc) ?? assetVideoSrc;
+  const systemAudioSrc = useMemo(
+    () => (artifact?.systemAudioPath ? convertFileSrc(artifact.systemAudioPath) : null),
+    [artifact],
+  );
+  const micAudioSrc = useMemo(
+    () => (artifact?.micPath ? convertFileSrc(artifact.micPath) : null),
+    [artifact],
+  );
+  const hasSidecarAudio = systemAudioSrc !== null || micAudioSrc !== null;
+  // Decoded sidecar audio, used both for waveforms and Web Audio playback.
+  const [systemBuf, setSystemBuf] = useState<AudioBuffer | null>(null);
+  const [micBuf, setMicBuf] = useState<AudioBuffer | null>(null);
+  const cameraSrc = useMemo(
+    () => (artifact?.cameraPath ? convertFileSrc(artifact.cameraPath) : null),
+    [artifact],
+  );
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [cameraDuration, setCameraDuration] = useState(0);
 
   // The demo timeline is 12s; once a real recording is loaded use its duration.
   const DEMO_DURATION = 12;
@@ -2655,6 +3608,13 @@ export function Editor({
       setArtifact(a);
       setCurrentTime(0);
       setPlaying(false);
+      setSelectedAudioKey(null);
+      // Per-track edits belong to the previous clip.
+      setState((s) => ({
+        ...s,
+        audioTracks: defaultAudioTracks(),
+        camera: defaultCameraState(),
+      }));
       // A fresh recording: derive auto-zoom from its cursor sidecar.
       (async () => {
         const sidecar = await fetchSidecar(a);
@@ -2690,55 +3650,214 @@ export function Editor({
     return () => v.removeEventListener("loadedmetadata", onMeta);
   }, [videoSrc]);
 
-  // Decode the recording's audio and produce a peaks array so the timeline
-  // clip-block can render a real waveform (instead of the placeholder SVG).
+  // Decode audio into waveform peaks. With sidecar tracks present, the
+  // dedicated audio rows own the waveforms and the clip block shows none
+  // (the mp4's embedded audio duplicates the sidecars).
   useEffect(() => {
-    if (!videoSrc) {
+    if (!videoSrc || hasSidecarAudio) {
       setAudioPeaks(null);
       return;
     }
     let cancelled = false;
-    (async () => {
-      try {
-        const buf = await fetch(videoSrc).then((r) => r.arrayBuffer());
-        const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const ctx = new Ctx();
-        const audio: AudioBuffer = await new Promise((resolve, reject) =>
-          ctx.decodeAudioData(buf, resolve, reject),
-        );
-        const N = 260;
-        const ch0 = audio.getChannelData(0);
-        const hasCh1 = audio.numberOfChannels > 1;
-        const ch1 = hasCh1 ? audio.getChannelData(1) : null;
-        const block = Math.max(1, Math.floor(ch0.length / N));
-        const out: number[] = new Array(N);
-        let peak = 0;
-        for (let i = 0; i < N; i++) {
-          const start = i * block;
-          const end = Math.min(start + block, ch0.length);
-          let m = 0;
-          for (let j = start; j < end; j++) {
-            const a = Math.abs(ch0[j]);
-            if (a > m) m = a;
-            if (ch1) {
-              const b = Math.abs(ch1[j]);
-              if (b > m) m = b;
-            }
-          }
-          out[i] = m;
-          if (m > peak) peak = m;
-        }
-        ctx.close();
-        const norm = peak > 0.001 ? out.map((v) => v / peak) : null;
-        if (!cancelled) setAudioPeaks(norm);
-      } catch {
-        if (!cancelled) setAudioPeaks(null);
-      }
-    })();
+    void decodeAudioFromUrl(videoSrc).then((buf) => {
+      if (!cancelled) setAudioPeaks(buf ? peaksFromBuffer(buf) : null);
+    });
     return () => {
       cancelled = true;
     };
-  }, [videoSrc]);
+  }, [videoSrc, hasSidecarAudio]);
+
+  useEffect(() => {
+    if (!systemAudioSrc) {
+      setSystemPeaks(null);
+      setSystemBuf(null);
+      return;
+    }
+    let cancelled = false;
+    void decodeAudioFromUrl(systemAudioSrc).then((buf) => {
+      if (cancelled) return;
+      setSystemBuf(buf);
+      setSystemPeaks(buf ? (peaksFromBuffer(buf) ?? []) : []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [systemAudioSrc]);
+
+  useEffect(() => {
+    if (!micAudioSrc) {
+      setMicPeaks(null);
+      setMicBuf(null);
+      return;
+    }
+    let cancelled = false;
+    void decodeAudioFromUrl(micAudioSrc).then((buf) => {
+      if (cancelled) return;
+      setMicBuf(buf);
+      setMicPeaks(buf ? (peaksFromBuffer(buf) ?? []) : []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [micAudioSrc]);
+
+  // ---- Sidecar audio playback (Web Audio) --------------------------------
+  // The screen <video> is the master clock (muted — the sidecar tracks own
+  // all audio). Each track plays its decoded buffer through a GainNode;
+  // play/seek (re)starts an AudioBufferSourceNode at the video's time, and a
+  // rAF watcher applies mute/trim/gain and restarts a source if it drifts.
+  // The tracks' editable state rides a ref so the loop is subscription-free.
+  const audioSyncRef = useRef({ tracks: state.audioTracks, duration });
+  audioSyncRef.current = { tracks: state.audioTracks, duration };
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const bufs: { key: AudioTrackKey; buf: AudioBuffer }[] = [];
+    if (systemBuf) bufs.push({ key: "system", buf: systemBuf });
+    if (micBuf) bufs.push({ key: "mic", buf: micBuf });
+    v.muted = hasSidecarAudio;
+    if (bufs.length === 0) return;
+
+    const ctx = getAudioCtx();
+    const nodes = bufs.map(({ key, buf }) => {
+      const gain = ctx.createGain();
+      gain.gain.value = 0; // ramped by the rAF below
+      gain.connect(ctx.destination);
+      return {
+        key,
+        buf,
+        gain,
+        src: null as AudioBufferSourceNode | null,
+        startCtxT: 0,
+        startOffset: 0,
+      };
+    });
+    type Node = (typeof nodes)[number];
+
+    const stopNode = (n: Node) => {
+      if (!n.src) return;
+      try {
+        n.src.stop();
+      } catch {}
+      n.src.disconnect();
+      n.src = null;
+    };
+    const startNode = (n: Node, t: number) => {
+      stopNode(n);
+      if (t >= n.buf.duration) return; // past the end of this track
+      const src = ctx.createBufferSource();
+      src.buffer = n.buf;
+      src.connect(n.gain);
+      src.start(0, Math.max(0, t));
+      n.src = src;
+      n.startCtxT = ctx.currentTime;
+      n.startOffset = Math.max(0, t);
+    };
+    const startAll = () => {
+      void ctx.resume().catch(() => {});
+      for (const n of nodes) startNode(n, v.currentTime);
+    };
+    const stopAll = () => {
+      for (const n of nodes) stopNode(n);
+    };
+
+    const onPlay = () => startAll();
+    const onPause = () => stopAll();
+    const onSeeked = () => {
+      if (!v.paused) startAll();
+    };
+    v.addEventListener("play", onPlay);
+    v.addEventListener("pause", onPause);
+    v.addEventListener("seeked", onSeeked);
+    if (!v.paused) startAll();
+
+    let raf = 0;
+    const tick = () => {
+      const { tracks, duration: dur } = audioSyncRef.current;
+      const t = v.currentTime;
+      for (const n of nodes) {
+        const ts = tracks[n.key];
+        const inWindow = t >= ts.trimStart - 1e-3 && t <= dur - ts.trimEnd + 1e-3;
+        n.gain.gain.value =
+          ts.muted || !inWindow ? 0 : Math.max(0, Math.min(1, ts.gain));
+        if (!v.paused && n.src) {
+          const expected = n.startOffset + (ctx.currentTime - n.startCtxT);
+          if (Math.abs(expected - t) > 0.12) startNode(n, t);
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+
+    return () => {
+      v.removeEventListener("play", onPlay);
+      v.removeEventListener("pause", onPause);
+      v.removeEventListener("seeked", onSeeked);
+      cancelAnimationFrame(raf);
+      stopAll();
+      for (const n of nodes) n.gain.disconnect();
+      v.muted = false;
+    };
+  }, [videoSrc, systemBuf, micBuf, hasSidecarAudio]);
+
+  // Slave the camera preview <video> to the master clock, shifted by the
+  // recorded camera start offset.
+  useEffect(() => {
+    const v = videoRef.current;
+    const c = cameraVideoRef.current;
+    if (!v || !c || !cameraSrc) return;
+    const offset = (artifact?.cameraOffsetMs ?? 0) / 1000;
+    const camTime = () => Math.max(0, v.currentTime - offset);
+    const syncTime = () => {
+      try {
+        c.currentTime = camTime();
+      } catch {}
+    };
+    const onPlay = () => {
+      syncTime();
+      void c.play().catch(() => {});
+    };
+    const onPause = () => {
+      c.pause();
+      syncTime();
+    };
+    v.addEventListener("play", onPlay);
+    v.addEventListener("pause", onPause);
+    v.addEventListener("seeking", syncTime);
+    v.addEventListener("seeked", syncTime);
+    if (!v.paused) onPlay();
+    let raf = 0;
+    const tick = () => {
+      if (!v.paused) {
+        if (Math.abs(c.currentTime - camTime()) > 0.08) syncTime();
+        if (c.paused) void c.play().catch(() => {});
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      v.removeEventListener("play", onPlay);
+      v.removeEventListener("pause", onPause);
+      v.removeEventListener("seeking", syncTime);
+      v.removeEventListener("seeked", syncTime);
+      cancelAnimationFrame(raf);
+      c.pause();
+    };
+  }, [videoSrc, cameraSrc, artifact?.cameraOffsetMs, state.camera.enabled]);
+
+  // Camera clip length, for the timeline's camera row.
+  useEffect(() => {
+    const c = cameraVideoRef.current;
+    if (!c || !cameraSrc) {
+      setCameraDuration(0);
+      return;
+    }
+    const onMeta = () => setCameraDuration(isFinite(c.duration) ? c.duration : 0);
+    if (c.readyState >= 1) onMeta();
+    c.addEventListener("loadedmetadata", onMeta);
+    return () => c.removeEventListener("loadedmetadata", onMeta);
+  }, [cameraSrc, state.camera.enabled]);
 
   // Drive playback / scrubbing on the real <video>.
   useEffect(() => {
@@ -2920,7 +4039,18 @@ export function Editor({
 
     setArtifact(project.artifact);
     histRebaseRef.current = true;
-    setState((s) => ({ ...s, ...project.editorState }));
+    // v1 projects predate audio tracks / camera — backfill defaults. Merge
+    // the camera over defaults so saves from before keyframes existed still
+    // load with a valid keyframes array.
+    setState((s) => ({
+      ...s,
+      ...project.editorState,
+      audioTracks: project.editorState.audioTracks ?? defaultAudioTracks(),
+      camera: project.editorState.camera
+        ? { ...defaultCameraState(), ...project.editorState.camera }
+        : defaultCameraState(),
+    }));
+    setSelectedAudioKey(null);
     setZoomSettingsRaw((s) => ({ ...s, ...project.zoomSettings }));
     setZoomSegments(project.zoomSegments ?? []);
     setSelectedZoomId(null);
@@ -2936,6 +4066,93 @@ export function Editor({
     } catch (e) {
       console.error("presentEditor failed", e);
     }
+  };
+
+  const audioRows = useMemo<AudioRowInfo[]>(() => {
+    const rows: AudioRowInfo[] = [];
+    if (systemAudioSrc) {
+      rows.push({ key: "system", label: "System audio", peaks: systemPeaks, track: state.audioTracks.system });
+    }
+    if (micAudioSrc) {
+      rows.push({ key: "mic", label: "Microphone", peaks: micPeaks, track: state.audioTracks.mic });
+    }
+    return rows;
+  }, [systemAudioSrc, micAudioSrc, systemPeaks, micPeaks, state.audioTracks]);
+
+  const selectAudioTrack = (key: AudioTrackKey | null) => {
+    setSelectedAudioKey(key);
+    if (key) {
+      setActiveRail("audio");
+      setSelectedZoomId(null);
+    }
+  };
+
+  // ---- Camera keyframes ---------------------------------------------------
+  // The bubble's effective transform at the playhead. With keyframes, the
+  // bubble animates; dragging it then writes/updates a keyframe at the
+  // playhead instead of moving the static base position.
+  const cameraEff = useMemo(
+    () => cameraAt(state.camera, currentTime),
+    [state.camera, currentTime],
+  );
+
+  const KF_EPS = 0.05; // keyframes closer than this (s) are replaced, not added
+
+  const handleCameraTransform = useCallback(
+    (p: { pos?: { x: number; y: number }; size?: number }) => {
+      setState((s) => {
+        const cam = s.camera;
+        if (cam.keyframes.length === 0) {
+          return {
+            ...s,
+            camera: {
+              ...cam,
+              ...(p.pos ? { pos: p.pos } : {}),
+              ...(p.size !== undefined ? { size: p.size } : {}),
+            },
+          };
+        }
+        const t = currentTimeRef.current;
+        const eff = cameraAt(cam, t);
+        const kf: CameraKeyframe = { t, pos: p.pos ?? eff.pos, size: p.size ?? eff.size };
+        const keyframes = [
+          ...cam.keyframes.filter((k) => Math.abs(k.t - t) > KF_EPS),
+          kf,
+        ].sort((a, b) => a.t - b.t);
+        return { ...s, camera: { ...cam, keyframes } };
+      });
+    },
+    [],
+  );
+
+  const addCameraKeyframe = () => {
+    const t = currentTimeRef.current;
+    setState((s) => {
+      const eff = cameraAt(s.camera, t);
+      const keyframes = [
+        ...s.camera.keyframes.filter((k) => Math.abs(k.t - t) > KF_EPS),
+        { t, pos: eff.pos, size: eff.size },
+      ].sort((a, b) => a.t - b.t);
+      return { ...s, camera: { ...s.camera, keyframes } };
+    });
+  };
+
+  const removeCameraKeyframe = (t: number) =>
+    setState((s) => ({
+      ...s,
+      camera: {
+        ...s.camera,
+        keyframes: s.camera.keyframes.filter((k) => k.t !== t),
+      },
+    }));
+
+  const clearCameraKeyframes = () =>
+    setState((s) => ({ ...s, camera: { ...s.camera, keyframes: [] } }));
+
+  const selectCamera = () => {
+    setActiveRail("webcam");
+    setSelectedZoomId(null);
+    setSelectedAudioKey(null);
   };
 
   // Route the native File-menu items to the handlers. Refs keep the
@@ -3010,6 +4227,11 @@ export function Editor({
           zoomSettings={zoomSettings}
           videoNaturalSize={videoNaturalSize}
           previewFps={previewFpsFor(perfSettings)}
+          cameraSrc={cameraSrc}
+          cameraEff={cameraEff}
+          cameraVideoRef={cameraVideoRef}
+          onCameraTransform={handleCameraTransform}
+          onCameraSelect={selectCamera}
         />
         <IconRail active={activeRail} setActive={setActiveRail} />
         <Inspector
@@ -3023,6 +4245,13 @@ export function Editor({
           setZoomSegments={setZoomSegments}
           selectedSeg={selectedSeg}
           videoSrc={videoSrc}
+          audioRows={audioRows}
+          onAudioTrack={setAudioTrack}
+          selectedAudioKey={selectedAudioKey}
+          duration={duration}
+          hasCamera={cameraSrc !== null}
+          onCameraAddKeyframe={addCameraKeyframe}
+          onCameraClearKeyframes={clearCameraKeyframes}
         />
         <div
           className="inspector-resizer"
@@ -3048,6 +4277,22 @@ export function Editor({
         setZoom={(v) => set({ zoom: v })}
         playing={playing}
         audioPeaks={audioPeaks}
+        audioRows={audioRows}
+        onAudioTrack={setAudioTrack}
+        selectedAudioKey={selectedAudioKey}
+        setSelectedAudioKey={selectAudioTrack}
+        cameraRow={
+          cameraSrc
+            ? {
+                offset: (artifact?.cameraOffsetMs ?? 0) / 1000,
+                duration: cameraDuration,
+                keyframes: state.camera.keyframes,
+                enabled: state.camera.enabled,
+              }
+            : null
+        }
+        onSelectCamera={selectCamera}
+        onRemoveCameraKeyframe={removeCameraKeyframe}
         zoomSegments={zoomSegments}
         setZoomSegments={setZoomSegments}
         cursorSidecar={cursorSidecar}
@@ -3093,6 +4338,23 @@ export function Editor({
             )}
             trimStart={state.trimStart}
             trimEnd={state.trimEnd}
+            audioTracks={[
+              ...(artifact.systemAudioPath
+                ? [{ path: artifact.systemAudioPath, ...state.audioTracks.system }]
+                : []),
+              ...(artifact.micPath
+                ? [{ path: artifact.micPath, ...state.audioTracks.mic }]
+                : []),
+            ]}
+            camera={
+              artifact.cameraPath
+                ? {
+                    path: artifact.cameraPath,
+                    offsetMs: artifact.cameraOffsetMs ?? 0,
+                    ...state.camera,
+                  }
+                : null
+            }
             onClose={() => setExportOpen(false)}
           />
         )}

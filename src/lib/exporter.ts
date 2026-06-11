@@ -6,6 +6,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   native,
+  type AudioTrackSpec,
   type CaptureArtifact,
   type CursorSidecar,
   type ExportFormat,
@@ -13,15 +14,46 @@ import {
 } from "./native";
 import type { ZoomSegment } from "./autoZoom";
 import {
+  cameraAt,
   computeFrameLayout,
   makeCursorRenderState,
   rasterizeGlyphs,
   renderFrame,
+  type CameraKeyframe,
   type CropRect,
+  type RenderFrameOpts,
 } from "./compositor";
+import { GLCompositor, rasterizeGlyphsGL } from "./compositorGL";
 
 export type ExportResolution = "720" | "1080" | "4k";
 export type ExportTarget = "file" | "clipboard";
+
+/**
+ * One sidecar audio track with its editor state, as handed to the exporter.
+ * Trims are timeline seconds (same convention as the clip trim: `trimStart`
+ * cuts the head, `trimEnd` cuts from the end of the full recording).
+ */
+export type ExportAudioTrack = {
+  path: string;
+  muted: boolean;
+  gain: number;
+  trimStart: number;
+  trimEnd: number;
+};
+
+/** The camera sidecar movie plus its bubble placement, for compositing. */
+export type ExportCameraTrack = {
+  path: string;
+  /** Camera start relative to the screen recording start (ms). */
+  offsetMs: number;
+  enabled: boolean;
+  pos: { x: number; y: number };
+  size: number;
+  shape: "circle" | "rounded";
+  mirrored: boolean;
+  /** Position/size keyframes (timeline seconds); empty = static placement. */
+  keyframes: CameraKeyframe[];
+};
 
 const RES_HEIGHT: Record<ExportResolution, number> = {
   "720": 720,
@@ -68,9 +100,10 @@ export function estimateExport(o: {
     const mbps = MP4_MBPS[o.preset][tier];
     bytes = (mbps * 1e6 * dur) / 8;
   }
-  // Render is the dominant cost: ~per-frame compositing relative to 720p area.
+  // Render dominates. GPU compositing + hardware encode brought the per-frame
+  // cost down ~4x vs the old Canvas2D + libx264 pipeline (seek time floors it).
   const areaFactor = (o.width * o.height) / (1280 * 720);
-  const seconds = dur * o.fps * areaFactor * 0.012 + 2;
+  const seconds = dur * o.fps * areaFactor * 0.003 + 2;
   return { seconds, bytes };
 }
 
@@ -139,6 +172,13 @@ export type ExportParams = {
   smoothing: number;
   trimStart: number;
   trimEnd: number;
+  /**
+   * Sidecar audio tracks to mix into the export. Empty when the recording
+   * has none — the mp4's own soundtrack is used as a fallback then.
+   */
+  audioTracks: ExportAudioTrack[];
+  /** Camera bubble to composite, or null when absent/hidden. */
+  camera: ExportCameraTrack | null;
   /** Live editor viewport box, so export geometry matches the preview. */
   viewportBox: { w: number; h: number };
   resolution: ExportResolution;
@@ -181,8 +221,10 @@ export async function exportVideo(
 ): Promise<ExportResult> {
   let sessionId: string | null = null;
   let unlistenProgress: (() => void) | null = null;
+  let glc: GLCompositor | null = null;
   const objectUrls: string[] = [];
   const video = document.createElement("video");
+  const cameraVideo = document.createElement("video");
   try {
     const layout = computeFrameLayout({
       aspectRatio: p.aspectRatio,
@@ -212,6 +254,28 @@ export async function exportVideo(
       );
     });
 
+    // Camera sidecar: a second offscreen video, seeked in lockstep with the
+    // main one (shifted by the recorded start offset).
+    const cam = p.camera && p.camera.enabled ? p.camera : null;
+    let cameraDur = 0;
+    if (cam) {
+      const camUrl = await fileObjectUrl(cam.path);
+      objectUrls.push(camUrl);
+      cameraVideo.muted = true;
+      cameraVideo.preload = "auto";
+      cameraVideo.playsInline = true;
+      cameraVideo.src = camUrl;
+      await new Promise<void>((resolve, reject) => {
+        cameraVideo.addEventListener("loadedmetadata", () => resolve(), { once: true });
+        cameraVideo.addEventListener(
+          "error",
+          () => reject(new Error("Failed to load camera recording for export")),
+          { once: true },
+        );
+      });
+      cameraDur = isFinite(cameraVideo.duration) ? cameraVideo.duration : 0;
+    }
+
     let wallpaperUrl: string | null = null;
     if (p.wallpaper.startsWith("/")) {
       wallpaperUrl = await fileObjectUrl(p.wallpaper);
@@ -227,22 +291,47 @@ export async function exportVideo(
     const durSec = Math.max(1 / p.fps, end - start);
     const totalFrames = Math.max(1, Math.round(durSec * p.fps));
 
+    // GPU path: composite on WebGL2 and (for mp4) stream raw RGBA frames
+    // straight into the hardware encoder — no per-frame PNG round-trip.
+    // Falls back to the Canvas2D + PNG pipeline when WebGL2 is unavailable.
+    const glCanvas = document.createElement("canvas");
+    glCanvas.width = dims.w;
+    glCanvas.height = dims.h;
+    glc = GLCompositor.create(glCanvas);
+    if (glc) {
+      try {
+        glc.setGlyphs(await rasterizeGlyphsGL());
+      } catch {
+        glc.dispose();
+        glc = null;
+      }
+    }
+    let ctx: CanvasRenderingContext2D | null = null;
+    let canvas2d: HTMLCanvasElement | null = null;
+    const ensure2d = () => {
+      if (ctx) return ctx;
+      canvas2d = document.createElement("canvas");
+      canvas2d.width = dims.w;
+      canvas2d.height = dims.h;
+      ctx = canvas2d.getContext("2d", { alpha: false });
+      if (!ctx) throw new Error("Could not create 2D canvas context");
+      return ctx;
+    };
+    if (!glc) ensure2d();
+
+    let raw = !!glc && p.format === "mp4";
     sessionId = await native.exportBegin(
       dims.w,
       dims.h,
       p.fps,
       p.format,
       p.preset,
+      raw,
     );
-
-    const canvas = document.createElement("canvas");
-    canvas.width = dims.w;
-    canvas.height = dims.h;
-    const ctx = canvas.getContext("2d", { alpha: false });
-    if (!ctx) throw new Error("Could not create 2D canvas context");
 
     const cursorState = makeCursorRenderState();
     const dtSec = 1 / p.fps;
+    let rawBuf: Uint8Array | undefined;
 
     for (let i = 0; i < totalFrames; i++) {
       if (p.signal.aborted) {
@@ -251,7 +340,14 @@ export async function exportVideo(
       }
       const t = Math.min(end - 1e-3, start + i / p.fps);
       await seekVideo(video, t);
-      renderFrame(ctx, {
+      if (cam) {
+        const camT = Math.max(
+          0,
+          Math.min(Math.max(0, cameraDur - 1e-3), t - cam.offsetMs / 1000),
+        );
+        await seekVideo(cameraVideo, camT);
+      }
+      const frameOpts: RenderFrameOpts = {
         layout,
         s,
         outW: dims.w,
@@ -270,9 +366,63 @@ export async function exportVideo(
         glyphImages,
         cursorState,
         dtSec,
-      });
-      const png = await canvasToPng(canvas);
-      await native.exportFrame(sessionId, i, png);
+        camera: cam
+          ? (() => {
+              // Keyframed bubble motion, evaluated at the absolute timeline
+              // time — identical to the editor preview.
+              const eff = cameraAt(cam, t);
+              return {
+                source: cameraVideo,
+                naturalSize: {
+                  w: cameraVideo.videoWidth || 1280,
+                  h: cameraVideo.videoHeight || 720,
+                },
+                pos: eff.pos,
+                size: eff.size,
+                shape: cam.shape,
+                mirrored: cam.mirrored,
+              };
+            })()
+          : null,
+      };
+
+      if (glc) {
+        try {
+          glc.render(frameOpts);
+        } catch (err) {
+          // A cross-origin texture or driver failure surfaces on the first
+          // frame — fall back to the Canvas2D + PNG pipeline. Later failures
+          // are real errors (frames already streamed in raw mode).
+          if (i > 0) throw err;
+          glc.dispose();
+          glc = null;
+          if (raw) {
+            await native.exportCancel(sessionId);
+            raw = false;
+            sessionId = await native.exportBegin(
+              dims.w,
+              dims.h,
+              p.fps,
+              p.format,
+              p.preset,
+              false,
+            );
+          }
+        }
+      }
+      let bytes: Uint8Array;
+      if (glc) {
+        if (raw) {
+          rawBuf = glc.readPixels(rawBuf);
+          bytes = rawBuf;
+        } else {
+          bytes = await canvasToPng(glCanvas);
+        }
+      } else {
+        renderFrame(ensure2d(), frameOpts);
+        bytes = await canvasToPng(canvas2d!);
+      }
+      await native.exportFrame(sessionId, i, bytes);
       p.onProgress((i + 1) / totalFrames * 0.9, "Rendering frames");
     }
 
@@ -296,20 +446,44 @@ export async function exportVideo(
     unlistenProgress = await native.onExportProgress((ev) => {
       if (ev.total > 0) {
         p.onProgress(
-          0.9 + (ev.done / ev.total) * 0.1,
+          Math.min(1, 0.9 + (ev.done / ev.total) * 0.1),
           "Encoding video",
         );
       }
     });
 
-    const audioSrc = p.format === "mp4" ? p.artifact.path : null;
-    const finalPath = await native.exportFinish(
-      sessionId,
-      outPath,
-      audioSrc,
-      start,
-      end,
-    );
+    // Map each audible track onto the exported window: read [srcStart,
+    // srcEnd] from the file and place it at `delay` seconds into the output.
+    // Track t=0 equals video t=0 by construction (the Rust side aligns the
+    // WAVs to the first video frame), so source and timeline times coincide.
+    let audioSpecs: AudioTrackSpec[] = [];
+    if (p.format === "mp4") {
+      const tracks: ExportAudioTrack[] =
+        p.audioTracks.length > 0
+          ? p.audioTracks
+          : [
+              // No sidecar tracks (old recording / dev fixture): fall back to
+              // the mp4's embedded soundtrack, preserving prior behavior.
+              { path: p.artifact.path, muted: false, gain: 1, trimStart: 0, trimEnd: 0 },
+            ];
+      audioSpecs = tracks
+        .filter((t) => !t.muted && t.gain > 0.001)
+        .map((t) => {
+          const s0 = Math.max(start, t.trimStart);
+          const s1 = Math.min(end, p.videoDurationSec - t.trimEnd);
+          if (s1 - s0 < 0.01) return null;
+          return {
+            path: t.path,
+            srcStart: s0,
+            srcEnd: s1,
+            delay: s0 - start,
+            gain: t.gain,
+          };
+        })
+        .filter((t): t is AudioTrackSpec => t !== null);
+    }
+
+    const finalPath = await native.exportFinish(sessionId, outPath, audioSpecs);
 
     if (p.target === "clipboard") {
       await native.copyFileToClipboard(finalPath);
@@ -327,8 +501,11 @@ export async function exportVideo(
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   } finally {
     if (unlistenProgress) unlistenProgress();
+    glc?.dispose({ loseContext: true });
     video.removeAttribute("src");
     video.load();
+    cameraVideo.removeAttribute("src");
+    cameraVideo.load();
     for (const u of objectUrls) URL.revokeObjectURL(u);
   }
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { CaptureHUD } from "./components/CaptureHUD";
+import { CaptureHUD, type CaptureAVSettings } from "./components/CaptureHUD";
 import { Editor } from "./components/Editor";
 import { Permissions } from "./components/Permissions";
 import { PickerOverlay } from "./components/PickerOverlay";
@@ -88,14 +88,18 @@ function RecordingPill({
 
 function HudWindow() {
   const [phase, setPhase] = useState<HudPhase>("idle");
-  const [pending, setPending] = useState<{ displayId: number; windowId: number | null; audioIndex: number | null; crop: CropRect | null } | null>(null);
+  const [pending, setPending] = useState<{ displayId: number; windowId: number | null; av: CaptureAVSettings; crop: CropRect | null } | null>(null);
   const [recStart, setRecStart] = useState<number | null>(null);
   const [pausedAt, setPausedAt] = useState<number | null>(null);
   const [pausedAccumMs, setPausedAccumMs] = useState(0);
   const [now, setNow] = useState(Date.now());
   const [error, setError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [audioIndexRef, setAudioIndexRef] = useState<number | null>(null);
+  const [avSettings, setAvSettings] = useState<CaptureAVSettings>({
+    systemAudio: false,
+    micDeviceId: null,
+    cameraDeviceId: null,
+  });
 
   // Tick the recording timer.
   useEffect(() => {
@@ -125,17 +129,17 @@ function HudWindow() {
     const offState = native.onPickerState((s) => setPickerOpen(s === "open"));
     const offSel = native.onPickerSelected((sel) => {
       setError(null);
-      setPending({ displayId: sel.displayId, windowId: sel.windowId, audioIndex: audioIndexRef, crop: sel.crop });
+      setPending({ displayId: sel.displayId, windowId: sel.windowId, av: avSettings, crop: sel.crop });
       setPhase("countdown");
     });
     return () => {
       void offState.then((f) => f());
       void offSel.then((f) => f());
     };
-  }, [audioIndexRef]);
+  }, [avSettings]);
 
-  const openPicker = (mode: "display" | "window" | "area", audioIndex: number | null) => {
-    setAudioIndexRef(audioIndex);
+  const openPicker = (mode: "display" | "window" | "area", av: CaptureAVSettings) => {
+    setAvSettings(av);
     void native.openPickerOverlays(mode).catch((e) => setError(String(e)));
   };
 
@@ -149,7 +153,9 @@ function HudWindow() {
       await native.startCapture({
         displayId: pending.displayId,
         windowId: pending.windowId,
-        audioIndex: pending.audioIndex,
+        systemAudio: pending.av.systemAudio,
+        micDeviceId: pending.av.micDeviceId,
+        cameraDeviceId: pending.av.cameraDeviceId,
         framerate: 30,
         crop: pending.crop,
       });

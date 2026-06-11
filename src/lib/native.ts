@@ -1,19 +1,27 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-export type CaptureSourceKind = "screen" | "camera" | "audio";
+export type CaptureSourceKind = "camera" | "audio";
 
 export type CaptureSource = {
+  // Native device id: SCK microphone id / AVCaptureDevice uniqueID.
   id: string;
   kind: CaptureSourceKind;
   label: string;
-  index: number;
+  isDefault: boolean;
 };
 
 export type CaptureArtifact = {
   id: string;
   path: string;
   durationMs: number;
+  // Sidecar tracks; present only when the matching source was recorded.
+  systemAudioPath?: string | null;
+  micPath?: string | null;
+  cameraPath?: string | null;
+  // Camera start relative to the screen recording start (ms; positive means
+  // the camera file starts later than the screen file).
+  cameraOffsetMs?: number | null;
 };
 
 export type CursorSidecarSample = { tMs: number; x: number; y: number };
@@ -82,7 +90,12 @@ export type CropRect = {
 export type StartCaptureArgs = {
   displayId: number;
   windowId?: number | null;
-  audioIndex: number | null;
+  // Record system (app) audio to a sidecar WAV track.
+  systemAudio?: boolean;
+  // Record this microphone (SCK device id) to a sidecar WAV track.
+  micDeviceId?: string | null;
+  // Record this camera (AVCaptureDevice uniqueID) to a sidecar movie.
+  cameraDeviceId?: string | null;
   framerate?: number;
   crop?: CropRect | null;
 };
@@ -157,10 +170,21 @@ export type ExportProgress = {
   total: number;
 };
 
+// One audio source to mix into an export: read [srcStart, srcEnd] seconds
+// from `path`, scale by `gain`, place it `delay` seconds into the output.
+export type AudioTrackSpec = {
+  path: string;
+  srcStart: number;
+  srcEnd: number;
+  delay: number;
+  gain: number;
+};
+
 export const native = {
   listMacWallpapers: () => invoke<MacWallpaper[]>("list_macos_wallpapers"),
   currentMacWallpaper: () => invoke<string | null>("current_macos_wallpaper"),
   listCaptureSources: () => invoke<CaptureSource[]>("list_capture_sources"),
+  requestCameraAccess: () => invoke<void>("request_camera_access"),
   startCapture: (args: StartCaptureArgs) =>
     invoke<string>("start_capture", { args }),
   stopCapture: () => invoke<CaptureArtifact>("stop_capture"),
@@ -187,16 +211,19 @@ export const native = {
     fps: number,
     format: ExportFormat,
     preset: ExportPreset,
+    /** True ⇒ frames arrive as raw RGBA and stream straight into ffmpeg. */
+    raw = false,
   ) =>
-    invoke<string>("export_begin", { width, height, fps, format, preset }),
-  // Raw PNG bytes are sent as the IPC body (efficient, no JSON/base64); the
-  // session id + frame index ride along as headers.
-  exportFrame: (sessionId: string, index: number, png: Uint8Array) =>
+    invoke<string>("export_begin", { width, height, fps, format, preset, raw }),
+  // Frame bytes (PNG, or raw RGBA in raw mode) are sent as the IPC body
+  // (efficient, no JSON/base64); the session id + frame index ride along as
+  // headers.
+  exportFrame: (sessionId: string, index: number, bytes: Uint8Array) =>
     invoke<void>(
       "export_frame",
-      png.buffer.slice(
-        png.byteOffset,
-        png.byteOffset + png.byteLength,
+      bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
       ) as ArrayBuffer,
       {
         headers: {
@@ -208,16 +235,12 @@ export const native = {
   exportFinish: (
     sessionId: string,
     outPath: string,
-    audioSrc: string | null,
-    audioStart: number,
-    audioEnd: number,
+    audioTracks: AudioTrackSpec[],
   ) =>
     invoke<string>("export_finish", {
       sessionId,
       outPath,
-      audioSrc,
-      audioStart,
-      audioEnd,
+      audioTracks,
     }),
   exportCancel: (sessionId: string) =>
     invoke<void>("export_cancel", { sessionId }),
