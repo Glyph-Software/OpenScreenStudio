@@ -10,5 +10,57 @@
   <string>OpenScreen Studio captures your screen to create polished recordings.</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>OpenScreen Studio uses Apple events to coordinate with other apps during capture.</string>
+  <!-- Overrides the bundler-generated entry from tauri.conf.json's
+       fileAssociations: identical, plus the document icon. The icns is the
+       app icon the bundler copies to Contents/Resources/icon.icns. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>OpenScreen Project</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>openscreen</string>
+      </array>
+      <key>CFBundleTypeIconFile</key>
+      <string>icon.icns</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>org.glyphsoftware.oss.project</string>
+      </array>
+    </dict>
+  </array>
+  <!-- Finder on modern macOS resolves custom-extension icons through the
+       UTI, so the exported declaration carries the icon too. -->
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>org.glyphsoftware.oss.project</string>
+      <key>UTTypeDescription</key>
+      <string>OpenScreen Studio project</string>
+      <!-- Deliberately NOT public.json/public.text: conforming to a text
+           type makes Finder show a Quick Look text thumbnail of the file
+           contents instead of the document icon. -->
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.data</string>
+        <string>public.content</string>
+      </array>
+      <key>UTTypeIconFile</key>
+      <string>icon.icns</string>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>openscreen</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
 </dict>
 </plist>

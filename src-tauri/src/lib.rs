@@ -228,6 +228,21 @@ fn dismiss_permissions(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    // The HUD's close button means "quit", but never tear down an editor
+    // session the user may still be working in — just hide the HUD then.
+    if let Some(editor) = app.get_webview_window("editor") {
+        if editor.is_visible().unwrap_or(false) {
+            if let Some(hud) = app.get_webview_window("hud") {
+                let _ = hud.hide();
+            }
+            return;
+        }
+    }
+    app.exit(0);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureSource {
@@ -478,13 +493,91 @@ fn list_capture_sources() -> Result<Vec<CaptureSource>, String> {
     Ok(Vec::new())
 }
 
-/// Fire the async camera TCC prompt if it hasn't been answered yet. The HUD
-/// calls this when the camera pill is toggled on, so the prompt is resolved
-/// before a recording ever starts.
+/// Map a camera/mic AVAuthorizationStatus to a stable string the frontend
+/// switches on: "authorized" | "notDetermined" | "denied" | "restricted".
+#[cfg(target_os = "macos")]
+fn auth_status_str(video: bool) -> String {
+    use objc2_av_foundation::AVAuthorizationStatus;
+    match camera::authorization(video) {
+        AVAuthorizationStatus::Authorized => "authorized",
+        AVAuthorizationStatus::NotDetermined => "notDetermined",
+        AVAuthorizationStatus::Denied => "denied",
+        AVAuthorizationStatus::Restricted => "restricted",
+        _ => "denied",
+    }
+    .into()
+}
+
+/// Current camera TCC status (no prompt). The HUD checks this before turning
+/// the camera pill on so it can prompt, guide to Settings, or proceed.
 #[tauri::command]
-fn request_camera_access() {
+fn check_camera_access() -> String {
     #[cfg(target_os = "macos")]
-    camera::request_camera_access();
+    {
+        return auth_status_str(true);
+    }
+    #[cfg(not(target_os = "macos"))]
+    "authorized".into()
+}
+
+/// Current microphone TCC status (no prompt).
+#[tauri::command]
+fn check_mic_access() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return auth_status_str(false);
+    }
+    #[cfg(not(target_os = "macos"))]
+    "authorized".into()
+}
+
+/// Request camera access, awaiting the TCC prompt. Returns whether access is
+/// granted. The HUD calls this when the camera pill is toggled on, so the
+/// prompt is resolved before a recording ever starts.
+#[tauri::command]
+async fn request_camera_access() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return tauri::async_runtime::spawn_blocking(|| camera::request_access_blocking(true))
+            .await
+            .unwrap_or(false);
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+/// Request microphone access, awaiting the TCC prompt. Returns whether access
+/// is granted.
+#[tauri::command]
+async fn request_mic_access() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return tauri::async_runtime::spawn_blocking(|| camera::request_access_blocking(false))
+            .await
+            .unwrap_or(false);
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+/// Deep-link to the relevant macOS Privacy & Security settings pane.
+/// `pane` is "camera" | "microphone" | "screen".
+#[tauri::command]
+fn open_privacy_settings(pane: String) {
+    #[cfg(target_os = "macos")]
+    {
+        let anchor = match pane.as_str() {
+            "camera" => "Privacy_Camera",
+            "microphone" => "Privacy_Microphone",
+            "screen" => "Privacy_ScreenCapture",
+            _ => "Privacy",
+        };
+        open_settings(&format!(
+            "x-apple.systempreferences:com.apple.preference.security?{anchor}"
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = pane;
 }
 
 fn output_path(id: &str) -> PathBuf {
@@ -1178,15 +1271,28 @@ fn finalize_recording(mut rec: ActiveRecording) -> Result<CaptureArtifact, Strin
 
     // Always shut the camera session down — even if the concat below fails,
     // the camera light must turn off.
-    let camera_result = rec.camera.take().map(|cam| cam.stop());
-    let (camera_path, camera_offset_ms) = match camera_result {
-        Some(Ok((path, camera_epoch))) => {
-            let offset = camera_epoch.map(|e| e - rec.cursor_track.started_epoch_ms);
-            (Some(path.to_string_lossy().to_string()), offset)
-        }
-        Some(Err(e)) => {
-            eprintln!("[camera] finalize failed: {e}");
-            (None, None)
+    let (camera_path, camera_offset_ms) = match rec.camera.take() {
+        Some(cam) => {
+            let (path, camera_epoch, result) = cam.stop();
+            if let Err(e) = &result {
+                // Non-fatal: AVFoundation routinely reports an "error" on a
+                // clean stop. Log it but decide usability from the file itself.
+                eprintln!("[camera] stop reported: {e}");
+            }
+            let on_disk = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if on_disk > 0 {
+                let offset = camera_epoch.map(|e| e - rec.cursor_track.started_epoch_ms);
+                eprintln!(
+                    "[camera] using movie {} ({} bytes), offset_ms={:?}",
+                    path.display(),
+                    on_disk,
+                    offset
+                );
+                (Some(path.to_string_lossy().to_string()), offset)
+            } else {
+                eprintln!("[camera] no usable movie written at {}", path.display());
+                (None, None)
+            }
         }
         None => (None, None),
     };
@@ -1926,6 +2032,79 @@ fn set_ns_window_level(_win: &tauri::WebviewWindow, _level: isize) {}
 const NS_WINDOW_LEVEL_STATUS: isize = 25;        // pickers sit here
 const NS_WINDOW_LEVEL_POPUP: isize = 101;        // HUD sits above pickers
 
+const CAMERA_PREVIEW_LABEL: &str = "camera-preview";
+const CAMERA_PREVIEW_SIZE: f64 = 240.0;
+const CAMERA_PREVIEW_MARGIN: f64 = 32.0;
+
+/// Show the floating camera preview window, creating it if needed. The webview
+/// runs `getUserMedia` and matches the requested camera by `device_label`
+/// (WebKit hashes deviceIds per-origin, so the AVCaptureDevice uniqueID can't
+/// be used directly). The window is our own process, so ScreenCaptureKit's
+/// self-exclusion keeps it out of every recording. Stays up during recording.
+#[tauri::command]
+fn show_camera_preview(app: AppHandle, device_label: Option<String>) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window(CAMERA_PREVIEW_LABEL) {
+        let _ = app.emit_to(CAMERA_PREVIEW_LABEL, "camera-preview-device", device_label);
+        win.show().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // Bottom-left of the main display, inset by a margin.
+    let displays = list_displays()?;
+    let main = displays
+        .iter()
+        .find(|d| d.is_main)
+        .or_else(|| displays.first());
+    let (x, y) = match main {
+        Some(d) => (
+            d.x + CAMERA_PREVIEW_MARGIN,
+            d.y + d.height - CAMERA_PREVIEW_SIZE - CAMERA_PREVIEW_MARGIN,
+        ),
+        None => (CAMERA_PREVIEW_MARGIN, CAMERA_PREVIEW_MARGIN),
+    };
+
+    let label = device_label.unwrap_or_default();
+    let url = format!(
+        "index.html?cameraPreview=1&label={}",
+        urlencoding_lite(&label)
+    );
+    let win = WebviewWindowBuilder::new(&app, CAMERA_PREVIEW_LABEL, WebviewUrl::App(url.into()))
+        .title("Camera")
+        .position(x, y)
+        .inner_size(CAMERA_PREVIEW_SIZE, CAMERA_PREVIEW_SIZE)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .focused(false)
+        .build()
+        .map_err(|e| format!("Failed to create camera preview: {e}"))?;
+    set_ns_window_level(&win, NS_WINDOW_LEVEL_POPUP);
+    win.show().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Hide (and tear down) the camera preview. We close rather than hide so
+/// WKWebView releases the camera and the green LED turns off.
+#[tauri::command]
+fn hide_camera_preview(app: AppHandle) {
+    close_camera_preview(&app);
+}
+
+fn close_camera_preview(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window(CAMERA_PREVIEW_LABEL) {
+        let _ = win.close();
+    }
+}
+
+/// Switch the live preview to a different camera (matched by label).
+#[tauri::command]
+fn set_camera_preview_device(app: AppHandle, device_label: Option<String>) {
+    let _ = app.emit_to(CAMERA_PREVIEW_LABEL, "camera-preview-device", device_label);
+}
+
 #[tauri::command]
 fn open_picker_overlays(
     app: AppHandle,
@@ -2279,6 +2458,8 @@ fn open_editor_with_artifact(app: AppHandle, artifact: CaptureArtifact) -> Resul
     if let Some(hud) = app.get_webview_window("hud") {
         let _ = hud.hide();
     }
+    // Don't leave a live camera running over the editor.
+    close_camera_preview(&app);
     Ok(())
 }
 
@@ -2380,10 +2561,45 @@ fn current_macos_wallpaper() -> Option<String> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct OpenedProject {
     path: String,
     contents: String,
+}
+
+/// A `.openscreen` file the OS asked us to open (Finder double-click) that
+/// the editor webview hasn't consumed yet. On a cold start the Opened event
+/// fires before the frontend has registered any listeners, so the file is
+/// stashed here and the editor takes it on mount; for an already-running app
+/// the `open-project-file` event reaches the editor directly.
+#[derive(Default)]
+struct PendingProjectFile(Mutex<Option<OpenedProject>>);
+
+fn handle_opened_project_file(app: &AppHandle, path: PathBuf) {
+    if path.extension().and_then(|e| e.to_str()) != Some("openscreen") {
+        return;
+    }
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return;
+    };
+    let opened = OpenedProject {
+        path: path.to_string_lossy().to_string(),
+        contents,
+    };
+    *app.state::<PendingProjectFile>().0.lock() = Some(opened.clone());
+    if let Some(editor) = app.get_webview_window("editor") {
+        let _ = editor.emit("open-project-file", &opened);
+        let _ = editor.show();
+        let _ = editor.set_focus();
+    }
+    if let Some(hud) = app.get_webview_window("hud") {
+        let _ = hud.hide();
+    }
+}
+
+#[tauri::command]
+fn take_pending_project_file(state: tauri::State<PendingProjectFile>) -> Option<OpenedProject> {
+    state.0.lock().take()
 }
 
 /// Prompt for a destination and write the serialized project JSON there.
@@ -3143,6 +3359,7 @@ pub fn run() {
         .manage(RecordingState::default())
         .manage(MeterState::default())
         .manage(PickerTrackerState::default())
+        .manage(PendingProjectFile::default())
         .setup(|app| {
             // In debug builds (or when OSS_SKIP_PERMS=1) skip the onboarding
             // window — `tauri dev` runs as the dev shell and re-prompts every
@@ -3335,6 +3552,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_capture_sources,
             request_camera_access,
+            request_mic_access,
+            check_camera_access,
+            check_mic_access,
+            open_privacy_settings,
+            show_camera_preview,
+            hide_camera_preview,
+            set_camera_preview_device,
             start_capture,
             stop_capture,
             finalize_external_stop,
@@ -3370,7 +3594,22 @@ pub fn run() {
             export_cancel,
             copy_file_to_clipboard,
             pick_export_path,
+            quit_app,
+            take_pending_project_file,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // Finder double-click on a .openscreen file (also drag-onto-Dock).
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = event {
+                for url in urls {
+                    if let Ok(path) = url.to_file_path() {
+                        handle_opened_project_file(app, path);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }

@@ -38,7 +38,7 @@ const PRESETS: {
   {
     id: "social",
     label: "Social Media",
-    desc: "Good for sharing on social media, etc. Compression is noticable when taking a good look. Keep in mind that social media server might further compress the video.",
+    desc: "Good for sharing on social media. Compression is noticeable on close inspection, and platforms may compress the video further.",
   },
   {
     id: "web",

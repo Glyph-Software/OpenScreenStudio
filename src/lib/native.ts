@@ -184,7 +184,23 @@ export const native = {
   listMacWallpapers: () => invoke<MacWallpaper[]>("list_macos_wallpapers"),
   currentMacWallpaper: () => invoke<string | null>("current_macos_wallpaper"),
   listCaptureSources: () => invoke<CaptureSource[]>("list_capture_sources"),
-  requestCameraAccess: () => invoke<void>("request_camera_access"),
+  requestCameraAccess: () => invoke<boolean>("request_camera_access"),
+  requestMicAccess: () => invoke<boolean>("request_mic_access"),
+  checkCameraAccess: () =>
+    invoke<"authorized" | "notDetermined" | "denied" | "restricted">(
+      "check_camera_access",
+    ),
+  checkMicAccess: () =>
+    invoke<"authorized" | "notDetermined" | "denied" | "restricted">(
+      "check_mic_access",
+    ),
+  openPrivacySettings: (pane: "camera" | "microphone" | "screen") =>
+    invoke<void>("open_privacy_settings", { pane }),
+  showCameraPreview: (deviceLabel: string | null) =>
+    invoke<void>("show_camera_preview", { deviceLabel }),
+  hideCameraPreview: () => invoke<void>("hide_camera_preview"),
+  setCameraPreviewDevice: (deviceLabel: string | null) =>
+    invoke<void>("set_camera_preview_device", { deviceLabel }),
   startCapture: (args: StartCaptureArgs) =>
     invoke<string>("start_capture", { args }),
   stopCapture: () => invoke<CaptureArtifact>("stop_capture"),
@@ -256,6 +272,15 @@ export const native = {
     invoke<{ path: string; contents: string } | null>("open_project"),
   presentEditor: () => invoke<void>("present_editor"),
 
+  // Finder double-click on a .openscreen file: the event covers a running
+  // app; the take command covers a cold start (event fires before listeners).
+  takePendingProjectFile: () =>
+    invoke<{ path: string; contents: string } | null>("take_pending_project_file"),
+  onOpenProjectFile: (
+    cb: (p: { path: string; contents: string }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ path: string; contents: string }>("open-project-file", (e) => cb(e.payload)),
+
   onMenuSaveProject: (cb: () => void): Promise<UnlistenFn> =>
     listen<null>("menu:save-project", () => cb()),
   onMenuOpenProject: (cb: () => void): Promise<UnlistenFn> =>
@@ -274,6 +299,7 @@ export const native = {
   requestScreenRecording: () => invoke<boolean>("request_screen_recording"),
   requestAccessibility: () => invoke<boolean>("request_accessibility"),
   dismissPermissions: () => invoke<void>("dismiss_permissions"),
+  quitApp: () => invoke<void>("quit_app"),
 
   listDisplays: () => invoke<DisplayInfo[]>("list_displays"),
   listWindows: () => invoke<WindowInfo[]>("list_windows"),

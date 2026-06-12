@@ -97,8 +97,7 @@ export const Ico = {
   ),
   cameraSlash: (p: IcoProps) => (
     <Sv {...p}>
-      <path d="M3 7a2 2 0 0 1 2-2h7l2 3h2a2 2 0 0 1 2 2v6" />
-      <path d="M19 17v0a2 2 0 0 1-2 2H6.5" />
+      <path d="M3 7a2 2 0 0 1 2-2h7l2 3h2a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
       <path d="M3 3l18 18" />
     </Sv>
   ),

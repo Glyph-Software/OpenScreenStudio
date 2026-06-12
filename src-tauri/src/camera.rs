@@ -29,9 +29,10 @@ use objc2_av_foundation::{
     AVCaptureDeviceDiscoverySession, AVCaptureDeviceInput, AVCaptureDevicePosition,
     AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeContinuityCamera,
     AVCaptureDeviceTypeExternal, AVCaptureFileOutput, AVCaptureFileOutputRecordingDelegate,
-    AVCaptureMovieFileOutput, AVCaptureSession, AVCaptureSessionPresetHigh, AVMediaTypeVideo,
+    AVCaptureMovieFileOutput, AVCaptureSession, AVCaptureSessionPresetHigh,
+    AVErrorRecordingSuccessfullyFinishedKey, AVMediaType, AVMediaTypeAudio, AVMediaTypeVideo,
 };
-use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSString, NSURL};
+use objc2_foundation::{NSArray, NSError, NSNumber, NSObject, NSObjectProtocol, NSString, NSURL};
 use parking_lot::Mutex;
 
 use crate::CaptureSource;
@@ -71,12 +72,52 @@ pub fn list_camera_devices() -> Vec<CaptureSource> {
     }
 }
 
-pub fn camera_authorization() -> AVAuthorizationStatus {
+/// The AVMediaType for the given track kind: `true` → video (camera),
+/// `false` → audio (microphone).
+fn media_type(video: bool) -> Option<&'static AVMediaType> {
     unsafe {
-        match AVMediaTypeVideo {
-            Some(video) => AVCaptureDevice::authorizationStatusForMediaType(video),
+        if video {
+            AVMediaTypeVideo
+        } else {
+            AVMediaTypeAudio
+        }
+    }
+}
+
+/// TCC authorization status for the camera (`video = true`) or microphone
+/// (`video = false`).
+pub fn authorization(video: bool) -> AVAuthorizationStatus {
+    unsafe {
+        match media_type(video) {
+            Some(mt) => AVCaptureDevice::authorizationStatusForMediaType(mt),
             None => AVAuthorizationStatus::Denied,
         }
+    }
+}
+
+pub fn camera_authorization() -> AVAuthorizationStatus {
+    authorization(true)
+}
+
+/// Request camera (`video = true`) or microphone (`video = false`) access,
+/// blocking until the user answers the TCC prompt. Returns whether access is
+/// granted. Already-determined states resolve immediately without prompting.
+pub fn request_access_blocking(video: bool) -> bool {
+    unsafe {
+        let Some(mt) = media_type(video) else { return false };
+        match AVCaptureDevice::authorizationStatusForMediaType(mt) {
+            AVAuthorizationStatus::Authorized => return true,
+            AVAuthorizationStatus::Denied | AVAuthorizationStatus::Restricted => return false,
+            _ => {}
+        }
+        // NotDetermined: fire the prompt and wait for the completion handler,
+        // which fires on an arbitrary dispatch queue after the user answers.
+        let (tx, rx) = mpsc::channel::<bool>();
+        let block = block2::RcBlock::new(move |granted: Bool| {
+            let _ = tx.send(granted.as_bool());
+        });
+        AVCaptureDevice::requestAccessForMediaType_completionHandler(mt, &block);
+        rx.recv_timeout(Duration::from_secs(120)).unwrap_or(false)
     }
 }
 
@@ -93,6 +134,28 @@ pub fn request_camera_access() {
         }
         let block = block2::RcBlock::new(|_granted: Bool| {});
         AVCaptureDevice::requestAccessForMediaType_completionHandler(video, &block);
+    }
+}
+
+/// AVFoundation hands `didFinishRecording` a non-nil `error` even when the
+/// movie was written successfully — a normal stop, or hitting a size/duration
+/// limit, both surface as an "error" whose userInfo carries
+/// `AVErrorRecordingSuccessfullyFinishedKey == YES`. That flag is the
+/// authoritative signal: when it's set the file is complete and playable, so
+/// the recording must NOT be reported as failed. Treating every non-nil error
+/// as a failure is what silently dropped a perfectly good camera movie.
+fn recording_failed(error: &NSError) -> bool {
+    unsafe {
+        let Some(key) = AVErrorRecordingSuccessfullyFinishedKey else {
+            return true;
+        };
+        match error.userInfo().objectForKey(key) {
+            Some(val) => match val.downcast::<NSNumber>() {
+                Ok(num) => !num.boolValue(),
+                Err(_) => true,
+            },
+            None => true,
+        }
     }
 }
 
@@ -133,7 +196,10 @@ define_class!(
             _connections: &NSArray<AVCaptureConnection>,
             error: Option<&NSError>,
         ) {
-            let err = error.map(|e| e.localizedDescription().to_string());
+            let err = match error {
+                Some(e) if recording_failed(e) => Some(e.localizedDescription().to_string()),
+                _ => None,
+            };
             if let Some(tx) = self.ivars().finished_tx.lock().take() {
                 let _ = tx.send(err);
             }
@@ -225,21 +291,29 @@ impl CameraRecorder {
         let _ = self.cmd_tx.send(CameraCmd::Resume);
     }
 
-    /// Finalize the movie. Returns (path, started_epoch_ms) on success.
-    pub fn stop(mut self) -> Result<(PathBuf, Option<i64>), String> {
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(CameraCmd::Stop(tx))
-            .map_err(|_| "Camera thread is gone.".to_string())?;
-        let res = rx
-            .recv_timeout(Duration::from_secs(8))
-            .map_err(|_| "Camera finalize timed out.".to_string())?;
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-        res?;
+    /// Finalize the movie. Always returns the output path + start epoch (so the
+    /// caller can fall back to the file actually written to disk); `result`
+    /// carries any error AVFoundation surfaced while finishing. Note that a
+    /// non-fatal `result` error does NOT mean the movie is unusable — a clean
+    /// stop frequently reports an "error" yet still writes a complete file.
+    pub fn stop(mut self) -> (PathBuf, Option<i64>, Result<(), String>) {
+        let result = (|| -> Result<(), String> {
+            let (tx, rx) = mpsc::channel();
+            self.cmd_tx
+                .send(CameraCmd::Stop(tx))
+                .map_err(|_| "Camera thread is gone.".to_string())?;
+            rx.recv_timeout(Duration::from_secs(8))
+                .map_err(|_| "Camera finalize timed out.".to_string())?
+        })();
+        // Deliberately DO NOT join the camera thread. By the time the reply
+        // above arrives, the movie file is fully finalized; the thread then
+        // calls `session.stopRunning()`, which AVFoundation services on the
+        // main thread. Joining here would block the caller (often the main
+        // thread itself) and deadlock against that teardown. Detach instead and
+        // let the thread wind the session down on its own.
+        self.handle.take();
         let epoch = *self.started_epoch_ms.lock();
-        Ok((self.path.clone(), epoch))
+        (self.path.clone(), epoch, result)
     }
 
     /// Tear down and delete the movie file.
@@ -248,9 +322,9 @@ impl CameraRecorder {
         if self.cmd_tx.send(CameraCmd::Discard(tx)).is_ok() {
             let _ = rx.recv_timeout(Duration::from_secs(8));
         }
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        // Detach rather than join, for the same deadlock reason as `stop()`:
+        // the thread's `session.stopRunning()` is serviced on the main thread.
+        self.handle.take();
     }
 }
 
@@ -355,18 +429,27 @@ fn camera_thread(
     let finish = finished_rx
         .recv_timeout(Duration::from_secs(6))
         .unwrap_or(Some("Camera finalize timed out.".into()));
-    unsafe { session.stopRunning() };
 
+    // The movie is finalized now (didFinishRecording fired above), so the
+    // caller has everything it needs — reply BEFORE tearing the session down.
+    // This ordering is critical: `session.stopRunning()` marshals to the main
+    // thread via `performSelector:waitUntilDone:`, and the caller
+    // (finalize_recording / discard) frequently runs on the main thread — if it
+    // were still blocked waiting on this reply, the main thread could never
+    // service that selector and both threads would deadlock. Unblocking first
+    // lets the caller return to its runloop so teardown can complete.
     if delete_file {
         let _ = std::fs::remove_file(&path);
     }
-    if let Some(reply) = reply_stop {
-        let _ = reply.send(match finish {
+    if let Some(reply) = reply_stop.take() {
+        let _ = reply.send(match &finish {
             None => Ok(()),
             Some(e) => Err(format!("Camera recording failed: {e}")),
         });
     }
-    if let Some(reply) = reply_discard {
+    if let Some(reply) = reply_discard.take() {
         let _ = reply.send(());
     }
+
+    unsafe { session.stopRunning() };
 }

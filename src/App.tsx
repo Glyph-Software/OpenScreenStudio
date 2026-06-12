@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { CaptureHUD, type CaptureAVSettings } from "./components/CaptureHUD";
+import { CameraPreview } from "./components/CameraPreview";
+import { CaptureHUD, getCountdownSecs, type CaptureAVSettings } from "./components/CaptureHUD";
 import { Editor } from "./components/Editor";
 import { Permissions } from "./components/Permissions";
 import { PickerOverlay } from "./components/PickerOverlay";
-import { Ico } from "./components/icons";
+import { HudIco } from "./components/hudIcons";
 import { useAccent } from "./hooks/useAccent";
 import { useTheme, useThemeMode } from "./hooks/useTheme";
 import { native, type CaptureArtifact, type CropRect } from "./lib/native";
@@ -14,21 +15,89 @@ type HudPhase = "idle" | "countdown" | "recording";
 
 const HUD_IDLE_SIZE = new LogicalSize(900, 75);
 const HUD_REC_SIZE = new LogicalSize(260, 52);
+const HUD_COUNTDOWN_SIZE = new LogicalSize(560, 64);
 
-function Countdown({ from = 3, onDone }: { from?: number; onDone: () => void }) {
-  const [n, setN] = useState(from);
+function Countdown({
+  from = 3,
+  onDone,
+  onCancel,
+}: {
+  from?: number;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [msLeft, setMsLeft] = useState(from * 1000);
+  // Keep the latest onDone without restarting the interval (the parent
+  // recreates the callback on every render).
+  const onDoneRef = useRef(onDone);
+  onDoneRef.current = onDone;
+  // The timer and the Continue button race; only fire once.
+  const firedRef = useRef(false);
+  const fire = () => {
+    if (firedRef.current) return;
+    firedRef.current = true;
+    onDoneRef.current();
+  };
   useEffect(() => {
-    if (n <= 0) {
-      onDone();
+    // "No countdown": start the capture immediately, never show the pill.
+    if (from <= 0) {
+      fire();
       return;
     }
-    const id = setTimeout(() => setN(n - 1), 700);
-    return () => clearTimeout(id);
-  }, [n, onDone]);
+    const start = Date.now();
+    const id = setInterval(() => {
+      const left = from * 1000 - (Date.now() - start);
+      if (left <= 0) {
+        clearInterval(id);
+        fire();
+      } else {
+        setMsLeft(left);
+      }
+    }, 50);
+    return () => clearInterval(id);
+  }, [from]);
+
+  const startDrag = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest("button")) return;
+    if (e.button !== 0) return;
+    e.preventDefault();
+    void getCurrentWindow().startDragging();
+  };
+
+  const R = 8;
+  const CIRC = 2 * Math.PI * R;
+  const frac = Math.max(0, Math.min(1, msLeft / (from * 1000)));
+
+  if (from <= 0) return null;
+
   return (
-    <div className="hud-stage">
-      <div key={n} className="countdown">
-        {n > 0 ? n : "Go"}
+    <div className="hud-stage" onMouseDown={startDrag}>
+      <div className="cd-pill" onMouseDown={startDrag}>
+        <button className="cd-close" onClick={onCancel} title="Cancel recording">
+          <HudIco.close size={13} />
+        </button>
+        <div className="cd-divider" />
+        <span className="cd-msg">Get ready. Recording will start soon.</span>
+        <div className="cd-divider" />
+        <button className="cd-continue" onClick={fire} title="Start recording now">
+          Continue
+          <span className="cd-ring">
+            <svg width="22" height="22" viewBox="0 0 22 22">
+              <circle
+                cx="11" cy="11" r={R}
+                fill="none" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2"
+              />
+              <circle
+                cx="11" cy="11" r={R}
+                fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+                strokeDasharray={CIRC}
+                strokeDashoffset={CIRC * (1 - frac)}
+                transform="rotate(-90 11 11)"
+              />
+            </svg>
+            <span className="cd-num">{Math.ceil(msLeft / 1000)}</span>
+          </span>
+        </button>
       </div>
     </div>
   );
@@ -64,7 +133,7 @@ function RecordingPill({
     <div className="hud-stage" onMouseDown={startDrag}>
       <div className="rec-pill" onMouseDown={startDrag}>
         <button className="rec-stop" onClick={onStop} title="Stop recording">
-          <Ico.stopCircle size={20} sw={2} />
+          <HudIco.stop size={20} />
           <span className="rec-time">{fmt(Math.max(0, elapsedMs))}</span>
         </button>
         <div className="rec-divider" />
@@ -73,13 +142,13 @@ function RecordingPill({
           onClick={onPauseToggle}
           title={paused ? "Resume" : "Pause"}
         >
-          {paused ? <Ico.playCircle size={20} sw={1.6} /> : <Ico.pauseCircle size={20} sw={1.6} />}
+          {paused ? <HudIco.play size={20} /> : <HudIco.pause size={20} />}
         </button>
         <button className="rec-btn" onClick={onRestart} title="Restart recording">
-          <Ico.restart size={18} sw={1.8} />
+          <HudIco.restart size={18} />
         </button>
         <button className="rec-btn" onClick={onCancel} title="Discard recording">
-          <Ico.trash size={18} sw={1.6} />
+          <HudIco.trash size={18} />
         </button>
       </div>
     </div>
@@ -115,7 +184,16 @@ function HudWindow() {
   // otherwise leave the pill off to one side of where the idle bar sat.
   useEffect(() => {
     const win = getCurrentWindow();
-    const target = phase === "recording" ? HUD_REC_SIZE : HUD_IDLE_SIZE;
+    // With countdown off, the countdown phase is a blank instant before
+    // recording — size straight to the recording pill to avoid a flash.
+    const target =
+      phase === "recording"
+        ? HUD_REC_SIZE
+        : phase === "countdown"
+          ? getCountdownSecs() > 0
+            ? HUD_COUNTDOWN_SIZE
+            : HUD_REC_SIZE
+          : HUD_IDLE_SIZE;
     void (async () => {
       try {
         await win.setSize(target);
@@ -259,7 +337,16 @@ function HudWindow() {
           pickerOpen={pickerOpen}
         />
       )}
-      {phase === "countdown" && <Countdown from={3} onDone={finishCountdown} />}
+      {phase === "countdown" && (
+        <Countdown
+          from={getCountdownSecs()}
+          onDone={finishCountdown}
+          onCancel={() => {
+            setPhase("idle");
+            resetRecordingState();
+          }}
+        />
+      )}
       {phase === "recording" && (
         <RecordingPill
           elapsedMs={
@@ -306,6 +393,7 @@ export default function App() {
   if (label === "editor")
     return <Editor themeMode={themeMode} setThemeMode={setThemeMode} />;
   if (label === "permissions") return <Permissions />;
+  if (label === "camera-preview") return <CameraPreview />;
   if (label.startsWith("picker-")) return <PickerOverlay />;
   return <HudWindow />;
 }

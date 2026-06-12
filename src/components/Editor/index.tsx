@@ -575,6 +575,18 @@ function Slider({
   }, []);
 
   const pct = ((value - min) / (max - min)) * 100;
+  const step = Math.max(1, Math.round((max - min) / 100));
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    let next: number | null = null;
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") next = value - step;
+    else if (e.key === "ArrowRight" || e.key === "ArrowUp") next = value + step;
+    else if (e.key === "Home") next = min;
+    else if (e.key === "End") next = max;
+    if (next === null) return;
+    e.preventDefault();
+    onChange(Math.max(min, Math.min(max, next)));
+  };
 
   return (
     <div className="slider-row">
@@ -582,6 +594,12 @@ function Slider({
         <div
           className="track"
           ref={ref}
+          role="slider"
+          tabIndex={0}
+          aria-valuemin={min}
+          aria-valuemax={max}
+          aria-valuenow={value}
+          onKeyDown={onKeyDown}
           onMouseDown={(e) => {
             dragging.current = true;
             setFromEvent(e);
@@ -636,8 +654,11 @@ function BackgroundPanel({ state, set }: { state: EditorState; set: (p: StatePat
           </div>
           <div className="wp-grid">
             {GRADIENTS.map((g) => (
-              <div
+              <button
                 key={g}
+                type="button"
+                aria-label={`Gradient ${g.replace("wp-", "")}`}
+                aria-pressed={state.wallpaper === g}
                 className={`wp-swatch ${g} ${state.wallpaper === g ? "on" : ""}`}
                 onClick={() => set({ wallpaper: g })}
               />
@@ -654,9 +675,12 @@ function BackgroundPanel({ state, set }: { state: EditorState; set: (p: StatePat
           </div>
           <div className="wp-grid">
             {wallpapers.map((wp) => (
-              <div
+              <button
                 key={wp.thumb}
+                type="button"
                 title={wp.name}
+                aria-label={wp.name}
+                aria-pressed={state.wallpaper === wp.full}
                 className={`wp-swatch ${state.wallpaper === wp.full ? "on" : ""}`}
                 style={{ backgroundImage: `url("${convertFileSrc(wp.thumb)}")` }}
                 onClick={() => set({ wallpaper: wp.full })}
@@ -1072,7 +1096,9 @@ function ZoomSegmentPanel({
         <button
           className={`switch ${seg.instant ? "on" : ""}`}
           onClick={() => patch({ instant: !seg.instant })}
-          aria-pressed={seg.instant}
+          role="switch"
+          aria-checked={seg.instant}
+          aria-label="Instant animation"
         />
       </div>
 
@@ -1083,7 +1109,9 @@ function ZoomSegmentPanel({
         <button
           className={`switch ${seg.disabled ? "on" : ""}`}
           onClick={() => patch({ disabled: !seg.disabled })}
-          aria-pressed={seg.disabled}
+          role="switch"
+          aria-checked={seg.disabled}
+          aria-label="Disable zoom"
         />
       </div>
 
@@ -4024,7 +4052,11 @@ export function Editor({
       return;
     }
     if (!res) return;
+    await loadProjectFile(res);
+  };
 
+  // Shared by the File-menu open dialog and Finder double-clicks.
+  const loadProjectFile = async (res: { path: string; contents: string }) => {
     let project: ProjectFile;
     try {
       project = JSON.parse(res.contents) as ProjectFile;
@@ -4159,20 +4191,42 @@ export function Editor({
   // listeners stable while always calling the latest closures.
   const saveRef = useRef(handleSaveProject);
   const openRef = useRef(handleOpenProject);
+  const loadRef = useRef(loadProjectFile);
   saveRef.current = handleSaveProject;
   openRef.current = handleOpenProject;
+  loadRef.current = loadProjectFile;
   useEffect(() => {
     let offSave: (() => void) | undefined;
     let offOpen: (() => void) | undefined;
+    let offFile: (() => void) | undefined;
     native.onMenuSaveProject(() => void saveRef.current()).then((u) => {
       offSave = u;
     });
     native.onMenuOpenProject(() => void openRef.current()).then((u) => {
       offOpen = u;
     });
+    // Finder double-click while the app is running. Clear the cold-start
+    // stash so the same file isn't replayed by a later take.
+    native
+      .onOpenProjectFile((p) => {
+        void native.takePendingProjectFile().catch(() => null);
+        void loadRef.current(p);
+      })
+      .then((u) => {
+        offFile = u;
+      });
+    // Cold start: the app was launched by double-clicking a .openscreen file
+    // and the Opened event fired before this webview was listening.
+    void native
+      .takePendingProjectFile()
+      .then((p) => {
+        if (p) void loadRef.current(p);
+      })
+      .catch(() => {});
     return () => {
       offSave?.();
       offOpen?.();
+      offFile?.();
     };
   }, []);
 

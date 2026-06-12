@@ -57,9 +57,11 @@ body:has(.editor-window) { background: var(--window-bg); }
   --panel-elev: #ffffff;
   --hairline: rgba(0, 0, 0, 0.10);
   --hairline-strong: rgba(0, 0, 0, 0.16);
-  --text-1: rgba(0, 0, 0, 0.85);
-  --text-2: rgba(0, 0, 0, 0.50);
-  --text-3: rgba(0, 0, 0, 0.28);
+  /* Darker than Apple's label opacities on purpose: 50%/28% grey reads as
+     washed-out on our flat panels, so secondary/tertiary get a real bump. */
+  --text-1: rgba(0, 0, 0, 0.92);
+  --text-2: rgba(0, 0, 0, 0.62);
+  --text-3: rgba(0, 0, 0, 0.42);
   --timeline-bg: #e6e6e9;
   --hover-bg: rgba(0, 0, 0, 0.05);
   --hover-bg-strong: rgba(0, 0, 0, 0.09);
@@ -70,6 +72,21 @@ body:has(.editor-window) { background: var(--window-bg); }
 
 button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
 input { font: inherit; color: inherit; }
+
+/* Keyboard focus: visible ring for tab navigation, none for mouse clicks. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+:focus:not(:focus-visible) { outline: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
 
 /* PICKER OVERLAY (per-display fullscreen overlay with hover highlight) */
 .picker-root {
@@ -83,14 +100,14 @@ input { font: inherit; color: inherit; }
 .picker-tint {
   position: absolute;
   inset: 0;
-  background: rgba(60, 90, 220, 0.0);
-  border: 0 solid rgba(94, 92, 230, 0.0);
+  background: color-mix(in srgb, var(--accent) 0%, transparent);
+  border: 0 solid color-mix(in srgb, var(--accent) 0%, transparent);
   transition: background 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
   pointer-events: none;
 }
 .picker-root.is-hovered .picker-tint {
-  background: rgba(60, 90, 220, 0.32);
-  border: 6px solid var(--accent, #5E5CE6);
+  background: color-mix(in srgb, var(--accent) 32%, transparent);
+  border: 6px solid var(--accent);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15);
 }
 .picker-center {
@@ -133,7 +150,7 @@ input { font: inherit; color: inherit; }
   gap: 8px;
   padding: 10px 14px 10px 12px;
   border-radius: 10px;
-  background: var(--accent, #5E5CE6);
+  background: var(--accent);
   color: #0c0c0e;
   font-size: 14px;
   font-weight: 600;
@@ -194,7 +211,7 @@ input { font: inherit; color: inherit; }
 .picker-area-dim-top { top: 0; left: 0; right: 0; }
 .picker-area-rect {
   position: absolute;
-  border: 2px solid var(--accent, #5E5CE6);
+  border: 2px solid var(--accent);
   box-shadow:
     inset 0 0 0 1px rgba(255,255,255,0.18),
     0 0 0 1px rgba(0,0,0,0.5);
@@ -237,9 +254,9 @@ input { font: inherit; color: inherit; }
 .picker-window-root { background: rgba(0, 0, 0, 0.18); }
 .picker-window-highlight {
   position: absolute;
-  border: 4px solid var(--accent, #5E5CE6);
+  border: 4px solid var(--accent);
   border-radius: 6px;
-  background: rgba(60, 90, 220, 0.20);
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15);
   pointer-events: none;
   transition: left 110ms ease, top 110ms ease, width 110ms ease, height 110ms ease;
@@ -327,6 +344,22 @@ input { font: inherit; color: inherit; }
 .hud-v2 .mode-btn.on .mode-label { color: var(--accent-vibrant, var(--accent)); }
 .hud-v2 .mode-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .hud-v2 .mode-icon { display: grid; place-items: center; transition: color 150ms; }
+
+/* Lucide icons in HUD — crisp strokes, no subpixel blur at small sizes */
+.hud-lucide {
+  display: block;
+  flex-shrink: 0;
+  shape-rendering: geometricPrecision;
+}
+.hud-v2 .status-pill .pill-toggle .hud-lucide {
+  opacity: 0.92;
+}
+.hud-v2 .status-pill.on .pill-toggle .hud-lucide {
+  opacity: 1;
+}
+.hud-v2 .status-pill.disabled .pill-toggle .hud-lucide {
+  opacity: 0.85;
+}
 .hud-v2 .mode-label {
   font-size: 11px;
   font-weight: 500;
@@ -443,6 +476,58 @@ input { font: inherit; color: inherit; }
   margin: 0 2px;
   color: rgba(255,255,255,0.85);
 }
+.hud-perm-hint {
+  bottom: -48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #ffd27a;
+}
+.hud-perm-settings {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.12);
+  color: rgba(255,255,255,0.9);
+  font-size: 11px;
+  cursor: pointer;
+}
+.hud-perm-settings:hover { background: rgba(255,255,255,0.2); }
+
+/* Floating webcam preview (own transparent window) */
+.cam-preview {
+  position: fixed;
+  inset: 0;
+  /* Squircle via a superellipse-ish radius; clipped so the video corners round. */
+  border-radius: 28%;
+  overflow: hidden;
+  background: #000;
+  cursor: grab;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.cam-preview:active { cursor: grabbing; }
+.cam-preview video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* Mirror like a typical selfie preview. */
+  transform: scaleX(-1);
+  pointer-events: none;
+}
+.cam-preview-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 12px;
+  text-align: center;
+  padding: 0 12px;
+}
 
 /* Small recording pill (shown while a capture is in progress) */
 .rec-pill {
@@ -490,16 +575,71 @@ input { font: inherit; color: inherit; }
 .rec-pill .rec-btn:hover { background: rgba(255, 255, 255, 0.10); }
 .rec-pill .rec-btn:active { transform: scale(0.94); }
 
-.countdown {
-  font-family: var(--font-display);
-  font-size: 220px;
-  font-weight: 200;
-  color: rgba(255,255,255,0.95);
-  text-shadow: 0 6px 40px rgba(0,0,0,0.6);
-  animation: countPop 1s ease-out;
-  letter-spacing: -0.04em;
+/* Countdown pill (shown between source selection and recording start) */
+.cd-pill {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  padding: 10px 18px 10px 14px;
+  border-radius: 22px;
+  color: var(--text-1);
+  animation: hudIn 320ms var(--ease-spring, cubic-bezier(0.5, 1.6, 0.4, 0.9));
 }
-@keyframes countPop { from { opacity: 0; transform: scale(1.4);} to { opacity: 1; transform: scale(1);} }
+.cd-pill .cd-close {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  color: #1c1c1e;
+  display: grid;
+  place-items: center;
+  transition: background 150ms, transform 150ms;
+}
+.cd-pill .cd-close:hover { background: #fff; transform: scale(1.05); }
+.cd-pill .cd-divider {
+  width: 1px;
+  height: 26px;
+  background: rgba(255, 255, 255, 0.18);
+  flex-shrink: 0;
+}
+.cd-pill .cd-msg {
+  flex: 1;
+  text-align: center;
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.85);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cd-pill .cd-continue {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--rec-red);
+  transition: background 150ms, filter 150ms;
+}
+.cd-pill .cd-continue:hover { background: rgba(255, 69, 58, 0.12); filter: brightness(1.08); }
+.cd-pill .cd-ring {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+}
+.cd-pill .cd-ring svg { position: absolute; inset: 0; }
+.cd-pill .cd-num {
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
 
 /* EDITOR WINDOW */
 .editor-window {
@@ -1480,7 +1620,7 @@ input { font: inherit; color: inherit; }
 }
 .camera-kf:hover {
   transform: translate(-50%, -50%) rotate(45deg) scale(1.3);
-  background: var(--accent, #4f8cff);
+  background: var(--accent);
 }
 
 /* Sidecar audio rows (system audio / microphone) */
@@ -1496,7 +1636,7 @@ input { font: inherit; color: inherit; }
 .audio-block.muted .waveform { opacity: 0.25; }
 .audio-block.muted { filter: saturate(0.35); }
 .tl-track.audio.selected .audio-block {
-  box-shadow: inset 0 0 0 1.5px var(--accent, #4f8cff);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
 }
 .audio-block .waveform {
   position: absolute; left: 0; right: 0; bottom: 0;
@@ -1714,11 +1854,11 @@ input { font: inherit; color: inherit; }
 
 /* TITLE-BAR CROP TOGGLE */
 .crop-toolbar-btn.on {
-  background: var(--accent-blue, #007aff);
+  background: var(--accent);
   color: #fff;
 }
 .crop-toolbar-btn.on .glyph { color: #fff; }
-.crop-toolbar-btn.on:hover { filter: brightness(1.08); background: var(--accent-blue, #007aff); }
+.crop-toolbar-btn.on:hover { filter: brightness(1.08); background: var(--accent); }
 
 /* CROP DIALOG */
 .crop-modal-backdrop {
@@ -1789,7 +1929,7 @@ input { font: inherit; color: inherit; }
 .crop-box {
   position: absolute;
   box-sizing: border-box;
-  border: 1.5px solid var(--accent-blue, #007aff);
+  border: 1.5px solid var(--accent);
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
   cursor: move;
 }
@@ -1808,7 +1948,7 @@ input { font: inherit; color: inherit; }
   width: 14px;
   height: 14px;
   background: #fff;
-  border: 1px solid var(--accent-blue, #007aff);
+  border: 1px solid var(--accent);
   border-radius: 3px;
 }
 .crop-handle-nw { left: -7px; top: -7px; cursor: nwse-resize; }

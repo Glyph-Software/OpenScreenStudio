@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import { CheckMenuItem, Menu, Submenu } from "@tauri-apps/api/menu";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Ico } from "./icons";
+import { HudIco } from "./hudIcons";
 import { native, type CaptureSource } from "../lib/native";
 
 const startWindowDrag = (e: React.MouseEvent) => {
@@ -14,6 +15,10 @@ const startWindowDrag = (e: React.MouseEvent) => {
 
 type Mode = "display" | "window" | "area" | "device";
 
+// Sentinel device-select value that turns the source off (it can't collide
+// with a real device id).
+const OFF_OPTION = "__off__";
+
 // What gets recorded alongside the screen. Resolved device ids, not toggles —
 // the HUD owns persistence; App just forwards this to start_capture.
 export type CaptureAVSettings = {
@@ -22,12 +27,21 @@ export type CaptureAVSettings = {
   cameraDeviceId: string | null;
 };
 
+// Only device *choices* persist. The camera/mic/system toggles always start
+// OFF on launch, so we no longer remember their on/off state.
 const LS = {
-  camera: "oss.capture.cameraOn",
-  mic: "oss.capture.micOn",
-  system: "oss.capture.systemOn",
   cameraId: "oss.capture.cameraId",
   micId: "oss.capture.micId",
+  countdownSecs: "oss.capture.countdownSecs",
+};
+
+export const COUNTDOWN_OPTIONS = [0, 3, 5, 10] as const;
+const DEFAULT_COUNTDOWN_SECS = 3;
+
+// Shared with App so the countdown phase reads the same persisted choice.
+export const getCountdownSecs = () => {
+  const v = Number(lsGet(LS.countdownSecs));
+  return (COUNTDOWN_OPTIONS as readonly number[]).includes(v) ? v : DEFAULT_COUNTDOWN_SECS;
 };
 
 const lsGet = (k: string) => {
@@ -90,11 +104,14 @@ function SourcePill({
       </span>
       {selectable && (
         <>
-          <Ico.chevDown size={11} style={{ opacity: 0.55, flexShrink: 0 }} />
+          <HudIco.chevronDown size={11} style={{ opacity: 0.55, flexShrink: 0 }} />
           <select
             className="pill-select"
             value={deviceId}
-            onChange={(e) => onDevice(e.target.value)}
+            onChange={(e) => {
+              if (e.target.value === OFF_OPTION) onToggle();
+              else onDevice(e.target.value);
+            }}
             title="Choose device"
           >
             {devices.map((d) => (
@@ -102,6 +119,7 @@ function SourcePill({
                 {d.label}
               </option>
             ))}
+            <option value={OFF_OPTION}>Turn off</option>
           </select>
         </>
       )}
@@ -120,12 +138,17 @@ export function CaptureHUD({
 }) {
   const [mode, setMode] = useState<Mode | null>(null);
   const [sources, setSources] = useState<CaptureSource[]>([]);
-  const [camera, setCamera] = useState(() => lsGet(LS.camera) === "1");
-  const [mic, setMic] = useState(() => lsGet(LS.mic) === "1");
-  const [system, setSystem] = useState(() => lsGet(LS.system) === "1");
+  // Camera/mic/system always start OFF on launch; only device choices persist.
+  const [camera, setCamera] = useState(false);
+  const [mic, setMic] = useState(false);
+  const [system, setSystem] = useState(false);
   const [cameraId, setCameraId] = useState(() => lsGet(LS.cameraId) ?? "");
   const [micId, setMicId] = useState(() => lsGet(LS.micId) ?? "");
+  const [countdownSecs, setCountdownSecs] = useState(getCountdownSecs);
   const [enumError, setEnumError] = useState<string | null>(null);
+  const [permHint, setPermHint] = useState<
+    { text: string; pane: "camera" | "microphone" | "screen" } | null
+  >(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -145,15 +168,88 @@ export function CaptureHUD({
   const activeCamera = pickDevice(cameras, cameraId);
   const activeMic = pickDevice(audios, micId);
 
-  const setCameraOn = (v: boolean) => {
-    setCamera(v);
-    lsSet(LS.camera, v ? "1" : "0");
-    // Resolve the TCC prompt now, not mid-recording-countdown.
-    if (v) void native.requestCameraAccess().catch(() => {});
+  const showHint = (
+    text: string,
+    pane: "camera" | "microphone" | "screen",
+  ) => {
+    setPermHint({ text, pane });
+    window.setTimeout(() => setPermHint(null), 6000);
   };
-  const setMicOn = (v: boolean) => { setMic(v); lsSet(LS.mic, v ? "1" : "0"); };
-  const setSystemOn = (v: boolean) => { setSystem(v); lsSet(LS.system, v ? "1" : "0"); };
-  const chooseCamera = (id: string) => { setCameraId(id); lsSet(LS.cameraId, id); };
+
+  // Camera toggle: gate on TCC, only flip on once access is granted, and bring
+  // up / tear down the floating preview window.
+  const setCameraOn = async (v: boolean) => {
+    setPermHint(null);
+    if (!v) {
+      setCamera(false);
+      void native.hideCameraPreview().catch(() => {});
+      return;
+    }
+    let status = await native.checkCameraAccess().catch(() => "denied" as const);
+    if (status === "notDetermined") {
+      const granted = await native.requestCameraAccess().catch(() => false);
+      status = granted ? "authorized" : "denied";
+    }
+    if (status !== "authorized") {
+      showHint(
+        "Camera access is off. Enable it in System Settings → Privacy & Security → Camera.",
+        "camera",
+      );
+      return;
+    }
+    setCamera(true);
+    void native.showCameraPreview(activeCamera?.label ?? null).catch(() => {});
+  };
+
+  const setMicOn = async (v: boolean) => {
+    setPermHint(null);
+    if (!v) {
+      setMic(false);
+      return;
+    }
+    let status = await native.checkMicAccess().catch(() => "denied" as const);
+    if (status === "notDetermined") {
+      const granted = await native.requestMicAccess().catch(() => false);
+      status = granted ? "authorized" : "denied";
+    }
+    if (status !== "authorized") {
+      showHint(
+        "Microphone access is off. Enable it in System Settings → Privacy & Security → Microphone.",
+        "microphone",
+      );
+      return;
+    }
+    setMic(true);
+  };
+
+  const setSystemOn = async (v: boolean) => {
+    setPermHint(null);
+    if (!v) {
+      setSystem(false);
+      return;
+    }
+    const perms = await native.checkPermissions().catch(() => null);
+    if (perms?.screenRecording) {
+      setSystem(true);
+      return;
+    }
+    // Triggers the native prompt or deep-links to Settings on a repeat click.
+    void native.requestScreenRecording().catch(() => {});
+    showHint(
+      "Screen Recording permission is required for system audio.",
+      "screen",
+    );
+  };
+
+  const chooseCamera = (id: string) => {
+    setCameraId(id);
+    lsSet(LS.cameraId, id);
+    // Keep the live preview in sync when the user switches camera.
+    if (camera) {
+      const next = cameras.find((d) => d.id === id);
+      void native.setCameraPreviewDevice(next?.label ?? null).catch(() => {});
+    }
+  };
   const chooseMic = (id: string) => { setMicId(id); lsSet(LS.micId, id); };
 
   const cameraLabel = camera ? (activeCamera?.label ?? "No camera") : "No camera";
@@ -181,7 +277,32 @@ export function CaptureHUD({
     });
   };
 
-  const close = () => { void getCurrentWindow().hide(); };
+  const close = () => { void native.quitApp().catch(() => getCurrentWindow().hide()); };
+
+  // Native popup so "Countdown" can host a real submenu (a <select> can't
+  // nest); macOS draws it outside the tiny HUD window.
+  const openSettingsMenu = async () => {
+    try {
+      const countdownItems = await Promise.all(
+        COUNTDOWN_OPTIONS.map((s) =>
+          CheckMenuItem.new({
+            id: `countdown-${s}`,
+            text: s === 0 ? "Off (start immediately)" : `${s} seconds`,
+            checked: s === countdownSecs,
+            action: () => {
+              setCountdownSecs(s);
+              lsSet(LS.countdownSecs, String(s));
+            },
+          }),
+        ),
+      );
+      const countdown = await Submenu.new({ text: "Countdown", items: countdownItems });
+      const menu = await Menu.new({ items: [countdown] });
+      await menu.popup();
+    } catch (e) {
+      setEnumError(String(e));
+    }
+  };
 
   const ModeBtn = ({ id, icon, label, disabled }: { id: Mode; icon: React.ReactNode; label: string; disabled?: boolean }) => (
     <button
@@ -199,14 +320,14 @@ export function CaptureHUD({
       <div style={{ position: "relative" }} onMouseDown={startWindowDrag}>
         <div className="hud hud-v2" onMouseDown={startWindowDrag}>
           <button className="hud-close" onClick={close} title="Close">
-            <Ico.xMark size={13} />
+            <HudIco.close size={13} />
           </button>
 
           <div className="mode-row">
-            <ModeBtn id="display" label="Display" icon={<Ico.display size={20} sw={1.6} />} />
-            <ModeBtn id="window" label="Window" icon={<Ico.windowApp size={20} sw={1.6} />} />
-            <ModeBtn id="area" label="Area" icon={<Ico.area size={20} sw={1.6} />} />
-            <ModeBtn id="device" label="Device" icon={<Ico.device size={20} sw={1.6} />} disabled />
+            <ModeBtn id="display" label="Display" icon={<HudIco.display size={20} />} />
+            <ModeBtn id="window" label="Window" icon={<HudIco.window size={20} />} />
+            <ModeBtn id="area" label="Area" icon={<HudIco.area size={20} />} />
+            <ModeBtn id="device" label="Device" icon={<HudIco.device size={20} />} disabled />
           </div>
 
           <div className="divider" />
@@ -215,8 +336,8 @@ export function CaptureHUD({
             className="pill-camera"
             on={camera && !!activeCamera}
             onToggle={() => setCameraOn(!(camera && !!activeCamera))}
-            iconOn={<Ico.camera size={16} sw={1.6} />}
-            iconOff={<Ico.cameraSlash size={16} sw={1.6} />}
+            iconOn={<HudIco.camera size={16} />}
+            iconOff={<HudIco.cameraOff size={16} />}
             label={cameraLabel}
             devices={cameras}
             deviceId={activeCamera?.id}
@@ -229,8 +350,8 @@ export function CaptureHUD({
             className="pill-mic"
             on={mic && !!activeMic}
             onToggle={() => setMicOn(!(mic && !!activeMic))}
-            iconOn={<Ico.mic size={16} sw={1.6} />}
-            iconOff={<Ico.micSlash size={16} sw={1.6} />}
+            iconOn={<HudIco.mic size={16} />}
+            iconOff={<HudIco.micOff size={16} />}
             label={micLabel}
             devices={audios}
             deviceId={activeMic?.id}
@@ -243,21 +364,32 @@ export function CaptureHUD({
             className="pill-system"
             on={system}
             onToggle={() => setSystemOn(!system)}
-            iconOn={<Ico.systemAudio size={16} sw={1.6} />}
-            iconOff={<Ico.systemAudioSlash size={16} sw={1.6} />}
+            iconOn={<HudIco.systemAudio size={16} />}
+            iconOff={<HudIco.systemAudioOff size={16} />}
             label={systemLabel}
           />
 
           <div className="divider" />
 
-          <button className="hud-gear" title="Settings">
-            <Ico.gear size={16} sw={1.6} />
-            <Ico.chevDown size={11} style={{ opacity: 0.7 }} />
+          <button className="hud-gear" title="Settings" onClick={() => void openSettingsMenu()}>
+            <HudIco.settings size={16} />
+            <HudIco.chevronDown size={11} style={{ opacity: 0.7 }} />
           </button>
         </div>
         {enumError && (
           <div className="hud-label" style={{ color: "#ff8a8a" }}>
             {enumError}
+          </div>
+        )}
+        {permHint && (
+          <div className="hud-label hud-perm-hint">
+            <span>{permHint.text}</span>
+            <button
+              className="hud-perm-settings"
+              onClick={() => void native.openPrivacySettings(permHint.pane)}
+            >
+              Open Settings
+            </button>
           </div>
         )}
       </div>
