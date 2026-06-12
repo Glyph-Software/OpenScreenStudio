@@ -79,6 +79,15 @@ jobs:
       # as "present" and fails `security import` on the empty data. A
       # `${{ ... || '' }}` expression always defines the var, so we instead
       # split into a signed step and an env-free ad-hoc step.
+      # Signed but NOT notarized. We sign with an Apple Development cert from a
+      # free account (no paid Developer Program), which can't notarize. The
+      # notarization env vars (APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID) are
+      # deliberately omitted: tauri-action treats them as *defined-but-empty*
+      # (a missing secret expands to "") and tries to notarize with blank
+      # credentials, which fails ("Invalid credentials" / "Team ID must be at
+      # least 3 characters"). Leaving them undefined makes it skip notarization.
+      # To enable real notarization later (paid account + Developer ID cert),
+      # add them back here with valid secret values.
       - name: Build and release (signed)
         if: steps.check_signing.outputs.enabled == 'true'
         uses: tauri-apps/tauri-action@v0
@@ -87,9 +96,6 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           # Use Bun for the Tauri CLI (repo is Bun-only).
           tauriScript: bun run tauri
