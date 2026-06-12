@@ -4,10 +4,10 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>OpenScreen Studio — cinematic screen recordings, open source</title>
-<meta name="description" content="An open-source macOS screen recorder with a polished editor: auto-zoom-on-click, cursor overlay, and wallpaper backgrounds. In-process ScreenCaptureKit. A free Screen Studio alternative." />
+<meta name="description" content="An open-source macOS screen recorder with a polished editor: auto-zoom-on-click, cursor overlay, wallpaper backgrounds, webcam, system + mic audio, and export to mp4 / gif. In-process ScreenCaptureKit. A free Screen Studio alternative." />
 <meta name="theme-color" content="#08070a" />
 <meta property="og:title" content="OpenScreen Studio" />
-<meta property="og:description" content="Cinematic screen recordings on macOS. Open source. Auto-zoom, cursor overlay, wallpaper backgrounds." />
+<meta property="og:description" content="Cinematic screen recordings on macOS. Open source. Auto-zoom, cursor overlay, wallpaper backgrounds, webcam, multi-track audio, and mp4 / gif export." />
 <meta property="og:type" content="website" />
 <link rel="icon" href="assets/logo.png" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -43,8 +43,9 @@
       </h1>
       <p class="lede">
         A free, open-source <a href="https://screen.studio" target="_blank" rel="noopener">Screen&nbsp;Studio</a>
-        alternative for macOS. Record in-process with ScreenCaptureKit, then let the editor
-        auto-zoom on every click, smooth the cursor, and drop your capture onto a gorgeous wallpaper.
+        alternative for macOS. Record your screen, webcam, and system + mic audio in-process with
+        ScreenCaptureKit, then let the editor auto-zoom on every click, smooth the cursor, drop your
+        capture onto a gorgeous wallpaper, and export to mp4 or gif.
       </p>
       <div class="cta-row">
         <a class="solid-btn" href="https://github.com/Glyph-Software/OpenScreenStudio" target="_blank" rel="noopener">
@@ -70,8 +71,8 @@
 
   <section class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span>Auto-zoom</span><i>✦</i><span>Cursor overlay</span><i>✦</i><span>Wallpaper backgrounds</span><i>✦</i><span>Pause / resume / restart</span><i>✦</i><span>Project save &amp; open</span><i>✦</i><span>Display · window · area</span><i>✦</i>
-      <span>Auto-zoom</span><i>✦</i><span>Cursor overlay</span><i>✦</i><span>Wallpaper backgrounds</span><i>✦</i><span>Pause / resume / restart</span><i>✦</i><span>Project save &amp; open</span><i>✦</i><span>Display · window · area</span><i>✦</i>
+      <span>Auto-zoom</span><i>✦</i><span>Cursor overlay</span><i>✦</i><span>Webcam bubble</span><i>✦</i><span>System + mic audio</span><i>✦</i><span>Export to mp4 / gif</span><i>✦</i><span>Wallpaper backgrounds</span><i>✦</i><span>Pause / resume / restart</span><i>✦</i><span>Display · window · area</span><i>✦</i>
+      <span>Auto-zoom</span><i>✦</i><span>Cursor overlay</span><i>✦</i><span>Webcam bubble</span><i>✦</i><span>System + mic audio</span><i>✦</i><span>Export to mp4 / gif</span><i>✦</i><span>Wallpaper backgrounds</span><i>✦</i><span>Pause / resume / restart</span><i>✦</i><span>Display · window · area</span><i>✦</i>
     </div>
   </section>
 
@@ -112,10 +113,28 @@
       <article class="card reveal" style="--d:.2s">
         <div class="card-icon">◆</div>
         <h3>In-process, no sidecar</h3>
-        <p>Recording is a native <code>SCStream</code> writing mp4 directly via ScreenCaptureKit. No ffmpeg in the capture path, no AVFoundation device juggling.</p>
+        <p>Recording is a native <code>SCStream</code> writing mp4 directly via ScreenCaptureKit. No ffmpeg in the capture path — just one clean artifact per take.</p>
       </article>
 
       <article class="card reveal" style="--d:.25s">
+        <div class="card-icon">◉</div>
+        <h3>Webcam bubble</h3>
+        <p>Your camera records to a hardware-encoded sidecar via AVFoundation, kept in sync with the screen. The editor composites it as a draggable, resizable bubble.</p>
+      </article>
+
+      <article class="card reveal" style="--d:.3s">
+        <div class="card-icon">♬</div>
+        <h3>System + mic audio</h3>
+        <p>ScreenCaptureKit captures system and microphone audio as separate, frame-aligned tracks — independently trimmable and mutable on the timeline.</p>
+      </article>
+
+      <article class="card reveal" style="--d:.35s">
+        <div class="card-icon">⤓</div>
+        <h3>Export to mp4 / gif</h3>
+        <p>An offline pipeline composites screen, camera, and background on WebGL2 and encodes to mp4 or gif — straight to a file or the clipboard.</p>
+      </article>
+
+      <article class="card reveal" style="--d:.4s">
         <div class="card-icon">⌘</div>
         <h3>Pause, resume, restart</h3>
         <p>Full transport control from a frameless always-on-top pill — or stop from the macOS menu bar and the app finalizes the same artifact.</p>
@@ -130,9 +149,9 @@
     </header>
     <ol class="steps">
       <li class="reveal"><b>01</b><h4>Pick a source</h4><p>Transparent overlays span every display. Choose a screen, window, or dragged area.</p></li>
-      <li class="reveal" style="--d:.08s"><b>02</b><h4>Record in-process</h4><p>ScreenCaptureKit streams straight to mp4 at 30fps while a cursor track polls clicks and shapes.</p></li>
-      <li class="reveal" style="--d:.16s"><b>03</b><h4>Hand off the artifact</h4><p>On stop, an mp4 plus a <code>.cursor.json</code> sidecar land in <code>~/Movies/OpenScreen&nbsp;Studio</code>.</p></li>
-      <li class="reveal" style="--d:.24s"><b>04</b><h4>Edit &amp; beautify</h4><p>The editor reads the sidecar, derives auto-zoom, paints the cursor overlay, and frames it on a wallpaper.</p></li>
+      <li class="reveal" style="--d:.08s"><b>02</b><h4>Record in-process</h4><p>ScreenCaptureKit streams the screen, webcam, and system + mic audio at 30fps while a cursor track polls clicks and shapes.</p></li>
+      <li class="reveal" style="--d:.16s"><b>03</b><h4>Hand off the artifact</h4><p>On stop, the mp4 lands in <code>~/Movies/OpenScreen&nbsp;Studio</code> alongside its sidecars — <code>.cursor.json</code>, the camera movie, and the audio tracks.</p></li>
+      <li class="reveal" style="--d:.24s"><b>04</b><h4>Edit, beautify &amp; export</h4><p>The editor reads the sidecars, derives auto-zoom, paints the cursor overlay, frames it on a wallpaper, then exports to mp4 or gif.</p></li>
     </ol>
   </section>
 
