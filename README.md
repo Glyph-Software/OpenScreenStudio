@@ -8,7 +8,7 @@ An open-source [Screen Studio](https://screen.studio) clone for macOS, built wit
 
 </div>
 
-Real, in-process screen capture via **ScreenCaptureKit** with a polished editor: auto-zoom-on-click, cursor overlay, wallpaper backgrounds, and project save/open. macOS only.
+Real, in-process screen capture via **ScreenCaptureKit** — plus webcam, microphone, and system-audio recording — with a polished editor: auto-zoom-on-click, cursor overlay, wallpaper backgrounds, a camera bubble, multi-track audio, and export to mp4 / gif. macOS only.
 
 ## Install
 
@@ -102,11 +102,14 @@ printf 'OpenScreen Studio Self-Signed' | gh secret set APPLE_SIGNING_IDENTITY
 ## How capture works
 
 - **Screen recording: ScreenCaptureKit**, entirely in-process via the `screencapturekit` crate. An `SCStream` + `SCRecordingOutput` writes mp4 directly — no ffmpeg sidecar in the recording path. Supports display, window, and cropped-area capture, plus pause / resume / restart / cancel.
-- **Audio source enumeration** parses `ffmpeg -f avfoundation -list_devices`; capture itself uses ScreenCaptureKit's built-in microphone path.
+- **Webcam sidecar.** The selected camera records to a sidecar QuickTime movie via AVFoundation (`AVCaptureSession` + `AVCaptureMovieFileOutput`, hardware-encoded), on its own thread. The editor composites it as a camera bubble; its pause/resume mirrors the screen recording's segment concat. See [`camera.rs`](src-tauri/src/camera.rs).
+- **System + microphone audio.** ScreenCaptureKit delivers system audio and mic audio (macOS 15+) as separate streams on the same `SCStream`; each is written to a WAV sidecar, anchored to the first video frame's timestamp so the tracks stay in sync, giving the editor independently editable audio tracks. See [`audio_tap.rs`](src-tauri/src/audio_tap.rs).
+- **Audio source enumeration** parses `ffmpeg -f avfoundation -list_devices`.
 - **Cursor sidecar.** During recording a `CursorTrack` records cursor position, clicks, and cursor-shape transitions, then writes a `<recording>.cursor.json` next to the mp4. The editor consumes this for auto-zoom-on-click and the cursor overlay.
 - **Mic metering:** `cpal` samples the default input and emits peak amplitude as `mic-level` events at ~30 Hz.
+- **Export.** An offline pipeline steps the recording frame-by-frame, composites screen + camera + background on WebGL2 (Canvas2D fallback), and encodes to mp4 or gif — to a file or the clipboard. See [`exporter.ts`](src/lib/exporter.ts).
 
-Recordings land in `~/Movies/OpenScreen Studio/OpenScreen-<timestamp>-<uuid>.mp4` (+ matching `.cursor.json`).
+Recordings land in `~/Movies/OpenScreen Studio/OpenScreen-<timestamp>-<uuid>.mp4`, alongside their sidecars: `.cursor.json`, the camera QuickTime movie, and the system / mic audio WAVs.
 
 **ffmpeg is bundled, not a `$PATH` dependency.** `scripts/fetch-ffmpeg.sh` runs on `postinstall` and downloads `src-tauri/binaries/ffmpeg-{aarch64,x86_64}-apple-darwin`, used only for audio-device enumeration.
 
@@ -148,10 +151,17 @@ See [AGENTS.md](./AGENTS.md) for deeper architecture notes.
 
 ## Roadmap
 
-- Webcam capture and compositing.
-- System-audio capture.
-- Real export pipeline (the Export button currently `alert()`s).
-- Richer timeline editing and effects.
+Shipped:
+
+- ✅ Webcam capture and compositing.
+- ✅ System-audio capture.
+- ✅ Real export pipeline — offline frame-by-frame compositing to mp4 / gif, to file or clipboard.
+- ✅ Timeline editing with per-track audio (mic / system) and auto-zoom segments.
+
+Planned:
+
+- Richer timeline effects (transitions, multi-clip trimming).
+- Apple notarization for friction-free installs.
 
 ## Contributing
 
