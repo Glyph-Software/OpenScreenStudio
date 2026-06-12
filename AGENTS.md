@@ -64,9 +64,11 @@ The script ([`scripts/bump-version.ts`](scripts/bump-version.ts)) refuses to run
 
 ```
 src/
-  App.tsx                       routes by window label: editor | permissions | picker-* | hud
+  App.tsx                       thin router: window label → component (no other logic)
   main.tsx                      React entry
   components/
+    HudWindow.tsx               HUD phase machine (idle | countdown | recording): window
+                                resizing, countdown pill, recording pill, capture commands
     CaptureHUD.tsx              pre-record HUD: mode row, camera/mic/system pills with
                                 per-toggle TCC checks, gear menu (native Tauri menu with a
                                 Countdown submenu: off/3/5/10s, persisted in localStorage)
@@ -92,9 +94,16 @@ src/
   vite-env.d.ts
 
 src-tauri/
-  src/lib.rs                    ~3500 lines: SCK capture, picker, cursor sidecar, export,
-                                all #[command]s
+  src/lib.rs                    crate root: module decls, shared imports, menu, setup + run()
+  src/permissions.rs            TCC probes/prompts (screen, accessibility), quit_app
+  src/capture.rs                recording state, SCK stream, cursor track, mic meter,
+                                camera/mic TCC commands, CG FFI shared with picker
+  src/picker.rs                 display/window enumeration, picker overlays, camera preview
+  src/editor.rs                 editor window handoff, dev fixture, wallpapers
+  src/project.rs                .openscreen save/open + Finder double-click handoff
+  src/export.rs                 export sessions: frame streaming + ffmpeg encode/mux
   src/camera.rs                 AVFoundation camera: enumeration, TCC auth, sidecar recorder
+  src/audio_tap.rs              SCK PCM taps → sidecar WAVs, segment concat
   src/main.rs                   thin entry; also handles --probe-screen-recording subprocess
   build.rs                      tauri-build
   binaries/                     bundled ffmpeg-{aarch64,x86_64}-apple-darwin (gitignored, fetched)
@@ -112,7 +121,7 @@ scripts/fetch-ffmpeg.sh         downloads the platform ffmpeg binaries (run on p
 
 ## Hot spots
 
-- **Rust capture backend** — [`src-tauri/src/lib.rs`](src-tauri/src/lib.rs). One large file (camera split into [`camera.rs`](src-tauri/src/camera.rs)). ~45 `#[tauri::command]`s grouped roughly as:
+- **Rust capture backend** — `src-tauri/src/`, one module per concern (see layout above). Shared imports live in [`lib.rs`](src-tauri/src/lib.rs); each module starts with `use super::*;` and exposes its items as `pub(crate)` so siblings (and `generate_handler![]` in lib.rs) reach them through lib.rs's glob re-imports. ~45 `#[tauri::command]`s grouped as:
   - permissions: `check_permissions`, `request_screen_recording`, `request_accessibility`, `dismiss_permissions`, `check_camera_access`, `request_camera_access`, `check_mic_access`, `request_mic_access`, `open_privacy_settings`
   - capture: `list_capture_sources`, `start_capture`, `pause_capture`, `resume_capture`, `cancel_capture`, `restart_capture`, `stop_capture`, `finalize_external_stop`, `is_recording`
   - camera preview: `show_camera_preview`, `hide_camera_preview`, `set_camera_preview_device`
