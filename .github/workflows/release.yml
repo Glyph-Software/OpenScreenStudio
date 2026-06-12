@@ -14,11 +14,27 @@ permissions:
 jobs:
   release:
     # Apple Silicon runner; we build a universal (arm64 + x86_64) bundle.
-    runs-on: macos-14
+    # Must have the macOS 15+ SDK: the screencapturekit crate's `macos_15_0`
+    # feature stubs out SCRecordingOutput (warn-only) when built against an
+    # older SDK, producing a binary that fails at runtime on every machine.
+    runs-on: macos-15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Hard-fail if the runner's SDK is too old instead of shipping a build
+      # with SCRecordingOutput silently stubbed out.
+      - name: Verify macOS SDK is 15+
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --show-sdk-version)"
+          echo "macOS SDK: $sdk"
+          major="${sdk%%.*}"
+          if [ "$major" -lt 15 ]; then
+            echo "::error::macOS SDK $sdk is too old — SCRecordingOutput (macos_15_0 feature) would be stubbed out. Use a runner/Xcode with SDK 15+."
+            exit 1
+          fi
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
