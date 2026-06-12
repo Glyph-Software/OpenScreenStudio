@@ -9,6 +9,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "sign-cert": "bash scripts/sign-cert.sh",
+    "build:signed": "APPLE_SIGNING_IDENTITY=\"Apple Development: admin@glyphsoftware.org (JF8G428TY4)\" bun run tauri build",
     "fetch-ffmpeg": "bash scripts/fetch-ffmpeg.sh",
     "postinstall": "bash scripts/fetch-ffmpeg.sh",
     "version": "bun run scripts/bump-version.ts",
