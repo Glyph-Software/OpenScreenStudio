@@ -46,6 +46,7 @@ import {
   SPEED_PRESETS,
   MIN_CLIP_SEC,
   clampSpeed,
+  mapSegmentPiecePatch,
   clipIndexAtOut,
   duplicateClip,
   fullClip,
@@ -2714,11 +2715,12 @@ function ZoomChip({
   onSelect: () => void;
 }) {
   const dragMode = useRef<null | "move" | "start" | "end">(null);
-  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number }>({
+  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number; lengthMs: number }>({
     trackWidth: 0,
     trackLeft: 0,
     startMs: 0,
     endMs: 0,
+    lengthMs: 0,
   });
 
   useEffect(() => {
@@ -2739,7 +2741,7 @@ function ZoomChip({
         // move: dxMs is the cursor's *absolute* position; preserve relative offset.
         // Recompute using delta from drag origin.
         const grabOffset = dragRef.current.startMs;
-        const len = endMs - startMs;
+        const len = dragRef.current.lengthMs;
         let newStart = dxMs - grabOffset;
         newStart = Math.max(0, Math.min(totalMs - len, newStart));
         onUpdate({ startMs: newStart, endMs: newStart + len });
@@ -2770,6 +2772,7 @@ function ZoomChip({
       trackLeft: rect.left,
       startMs: mode === "move" ? grab : seg.startMs,
       endMs: seg.endMs,
+      lengthMs: seg.endMs - seg.startMs,
     };
   };
 
@@ -2832,11 +2835,12 @@ function EffectChip({
   onSelect: () => void;
 }) {
   const dragMode = useRef<null | "move" | "start" | "end">(null);
-  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number }>({
+  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number; lengthMs: number }>({
     trackWidth: 0,
     trackLeft: 0,
     startMs: 0,
     endMs: 0,
+    lengthMs: 0,
   });
 
   useEffect(() => {
@@ -2855,7 +2859,7 @@ function EffectChip({
         onUpdate({ endMs: next });
       } else {
         const grabOffset = dragRef.current.startMs;
-        const len = endMs - startMs;
+        const len = dragRef.current.lengthMs;
         let newStart = dxMs - grabOffset;
         newStart = Math.max(0, Math.min(totalMs - len, newStart));
         onUpdate({ startMs: newStart, endMs: newStart + len });
@@ -2886,6 +2890,7 @@ function EffectChip({
       trackLeft: rect.left,
       startMs: mode === "move" ? grab : seg.startMs,
       endMs: seg.endMs,
+      lengthMs: seg.endMs - seg.startMs,
     };
   };
 
@@ -3249,13 +3254,6 @@ function Timeline({
 
   // Zoom/effect segments live in source time; show them where their source
   // range lands in the edited sequence and map chip edits back to source.
-  const srcMsFromOut = (c: PlacedClip, outMs: number) =>
-    Math.max(0, Math.min(srcDuration * 1000, (c.srcStart + (outMs / 1000 - c.outStart) * c.speed) * 1000));
-  const mapChipPatch = <P extends { startMs?: number; endMs?: number }>(c: PlacedClip, patch: P): P => ({
-    ...patch,
-    ...(patch.startMs !== undefined ? { startMs: srcMsFromOut(c, patch.startMs) } : {}),
-    ...(patch.endMs !== undefined ? { endMs: srcMsFromOut(c, patch.endMs) } : {}),
-  });
   const srcSpanFromOut = (o: number, lenSec: number) => {
     const c = clips[clipIndexAtOut(clips, o)];
     if (!c) return null;
@@ -3752,7 +3750,7 @@ function Timeline({
                 onUpdate={(patch) =>
                   setZoomSegments(
                     zoomSegments.map((s) =>
-                      s.id === seg.id ? { ...s, ...mapChipPatch(pc.clip, patch) } : s,
+                      s.id === seg.id ? { ...s, ...mapSegmentPiecePatch(pc.clip, seg, pc.outStart * 1000, patch, srcDuration * 1000) } : s,
                     ),
                   )
                 }
@@ -3822,7 +3820,7 @@ function Timeline({
                 onUpdate={(patch) =>
                   setEffectSegments(
                     effectSegments.map((s) =>
-                      s.id === seg.id ? { ...s, ...mapChipPatch(pc.clip, patch) } : s,
+                      s.id === seg.id ? { ...s, ...mapSegmentPiecePatch(pc.clip, seg, pc.outStart * 1000, patch, srcDuration * 1000) } : s,
                     ),
                   )
                 }
@@ -4556,12 +4554,12 @@ export function Editor({
 
   const audioSyncRef = useRef({
     tracks: state.audioTracks,
-    duration,
+    duration: srcDuration,
     auto: { system: 1, mic: 1 },
   });
   audioSyncRef.current = {
     tracks: state.audioTracks,
-    duration,
+    duration: srcDuration,
     auto: { system: systemAutoGain, mic: micAutoGain },
   };
 
