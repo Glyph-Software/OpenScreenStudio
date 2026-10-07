@@ -1234,29 +1234,29 @@ pub(crate) fn resume_capture(
 
 #[cfg(target_os = "macos")]
 #[tauri::command]
-pub(crate) fn cancel_capture(state: State<'_, RecordingState>) -> Result<(), String> {
+pub(crate) async fn cancel_capture(state: State<'_, RecordingState>) -> Result<(), String> {
     let rec = state
         .0
         .lock()
         .take()
         .ok_or_else(|| "No active recording.".to_string())?;
-    discard_recording(rec);
+    tauri::async_runtime::spawn_blocking(move || discard_recording(rec))
+        .await
+        .map_err(|e| format!("Cancel capture task failed: {e}"))?;
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 #[tauri::command]
-pub(crate) fn restart_capture(
+pub(crate) async fn restart_capture(
     app: AppHandle,
     state: State<'_, RecordingState>,
 ) -> Result<String, String> {
-    let prev_args = {
-        let mut guard = state.0.lock();
-        let rec = guard.take().ok_or_else(|| "No active recording.".to_string())?;
-        let args = rec.args.clone();
-        discard_recording(rec);
-        args
-    };
+    let rec = state.0.lock().take().ok_or_else(|| "No active recording.".to_string())?;
+    let prev_args = rec.args.clone();
+    tauri::async_runtime::spawn_blocking(move || discard_recording(rec))
+        .await
+        .map_err(|e| format!("Restart capture task failed: {e}"))?;
     start_capture(app, prev_args, state)
 }
 

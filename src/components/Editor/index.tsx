@@ -1,3 +1,4 @@
+import { mapSegmentChipPatch } from "../../lib/segmentChip";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Ico } from "../icons";
@@ -2217,9 +2218,11 @@ function Inspector({
   onSelectEffect,
   clipPanel,
   captionSources,
+  setCaptions,
   onSeekSrc,
 }: {
   captionSources: CaptionSource[];
+  setCaptions: (patch: Partial<CaptionsState>) => void;
   onSeekSrc: (t: number) => void;
   clipPanel: ClipPanelProps | null;
   active: string;
@@ -2290,7 +2293,7 @@ function Inspector({
       ) : active === "subtitles" ? (
         <SubtitlesPanel
           captions={state.captions}
-          setCaptions={(p) => set({ captions: { ...state.captions, ...p } })}
+          setCaptions={setCaptions}
           sources={captionSources}
           srcDuration={duration}
           srcTime={currentTime}
@@ -3279,6 +3282,8 @@ function ZoomChip({
   leftPct,
   widthPct,
   totalMs,
+  resizeStart = true,
+  resizeEnd = true,
   onUpdate,
   onDelete,
   selected,
@@ -3288,17 +3293,21 @@ function ZoomChip({
   leftPct: number;
   widthPct: number;
   totalMs: number;
+  resizeStart?: boolean;
+  resizeEnd?: boolean;
   onUpdate: (patch: Partial<ZoomSegment>) => void;
   onDelete: () => void;
   selected: boolean;
   onSelect: () => void;
 }) {
+  const dragUpdate = useRef(onUpdate);
   const dragMode = useRef<null | "move" | "start" | "end">(null);
-  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number }>({
+  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number; grabOffset: number }>({
     trackWidth: 0,
     trackLeft: 0,
     startMs: 0,
     endMs: 0,
+    grabOffset: 0,
   });
 
   useEffect(() => {
@@ -3311,18 +3320,18 @@ function ZoomChip({
       const dxMs = (dxPct / 100) * totalMs;
       if (mode === "start") {
         const next = Math.max(0, Math.min(endMs - 50, dxMs));
-        onUpdate({ startMs: next });
+        dragUpdate.current({ startMs: next });
       } else if (mode === "end") {
         const next = Math.max(startMs + 50, Math.min(totalMs, dxMs));
-        onUpdate({ endMs: next });
+        dragUpdate.current({ endMs: next });
       } else {
         // move: dxMs is the cursor's *absolute* position; preserve relative offset.
         // Recompute using delta from drag origin.
-        const grabOffset = dragRef.current.startMs;
+        const grabOffset = dragRef.current.grabOffset;
         const len = endMs - startMs;
         let newStart = dxMs - grabOffset;
         newStart = Math.max(0, Math.min(totalMs - len, newStart));
-        onUpdate({ startMs: newStart, endMs: newStart + len });
+        dragUpdate.current({ startMs: newStart, endMs: newStart + len });
       }
     };
     const up = () => {
@@ -3340,15 +3349,18 @@ function ZoomChip({
     e.stopPropagation();
     e.preventDefault();
     onSelect();
+    if ((mode === "start" && !resizeStart) || (mode === "end" && !resizeEnd)) return;
     const track = (e.currentTarget as HTMLElement).closest(".tl-track.zoom") as HTMLElement | null;
     if (!track) return;
     const rect = track.getBoundingClientRect();
     const grab = ((e.clientX - rect.left) / rect.width) * totalMs - seg.startMs;
+    dragUpdate.current = onUpdate;
     dragMode.current = mode;
     dragRef.current = {
       trackWidth: rect.width,
       trackLeft: rect.left,
-      startMs: mode === "move" ? grab : seg.startMs,
+      startMs: seg.startMs,
+      grabOffset: grab,
       endMs: seg.endMs,
     };
   };
@@ -3366,17 +3378,17 @@ function ZoomChip({
       onMouseDown={beginDrag("move")}
       title={`${seg.targetLevel.toFixed(1)}× · click to drag, edges to resize`}
     >
-      <span
+      {resizeStart && <span
         className="handle left"
         onMouseDown={beginDrag("start")}
-      />
+      />}
       <span className="body">
         <Ico.zoomIn size={10} /> {seg.targetLevel.toFixed(1)}×
       </span>
-      <span
+      {resizeEnd && <span
         className="handle right"
         onMouseDown={beginDrag("end")}
-      />
+      />}
       <button
         className="del"
         onMouseDown={(e) => e.stopPropagation()}
@@ -3397,6 +3409,8 @@ function EffectChip({
   leftPct,
   widthPct,
   totalMs,
+  resizeStart = true,
+  resizeEnd = true,
   onUpdate,
   onDelete,
   selected,
@@ -3406,17 +3420,21 @@ function EffectChip({
   leftPct: number;
   widthPct: number;
   totalMs: number;
+  resizeStart?: boolean;
+  resizeEnd?: boolean;
   onUpdate: (patch: Partial<EffectSegment>) => void;
   onDelete: () => void;
   selected: boolean;
   onSelect: () => void;
 }) {
+  const dragUpdate = useRef(onUpdate);
   const dragMode = useRef<null | "move" | "start" | "end">(null);
-  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number }>({
+  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number; grabOffset: number }>({
     trackWidth: 0,
     trackLeft: 0,
     startMs: 0,
     endMs: 0,
+    grabOffset: 0,
   });
 
   useEffect(() => {
@@ -3429,16 +3447,16 @@ function EffectChip({
       const dxMs = (dxPct / 100) * totalMs;
       if (mode === "start") {
         const next = Math.max(0, Math.min(endMs - 50, dxMs));
-        onUpdate({ startMs: next });
+        dragUpdate.current({ startMs: next });
       } else if (mode === "end") {
         const next = Math.max(startMs + 50, Math.min(totalMs, dxMs));
-        onUpdate({ endMs: next });
+        dragUpdate.current({ endMs: next });
       } else {
-        const grabOffset = dragRef.current.startMs;
+        const grabOffset = dragRef.current.grabOffset;
         const len = endMs - startMs;
         let newStart = dxMs - grabOffset;
         newStart = Math.max(0, Math.min(totalMs - len, newStart));
-        onUpdate({ startMs: newStart, endMs: newStart + len });
+        dragUpdate.current({ startMs: newStart, endMs: newStart + len });
       }
     };
     const up = () => {
@@ -3456,15 +3474,18 @@ function EffectChip({
     e.stopPropagation();
     e.preventDefault();
     onSelect();
+    if ((mode === "start" && !resizeStart) || (mode === "end" && !resizeEnd)) return;
     const track = (e.currentTarget as HTMLElement).closest(".tl-track.effects") as HTMLElement | null;
     if (!track) return;
     const rect = track.getBoundingClientRect();
     const grab = ((e.clientX - rect.left) / rect.width) * totalMs - seg.startMs;
+    dragUpdate.current = onUpdate;
     dragMode.current = mode;
     dragRef.current = {
       trackWidth: rect.width,
       trackLeft: rect.left,
-      startMs: mode === "move" ? grab : seg.startMs,
+      startMs: seg.startMs,
+      grabOffset: grab,
       endMs: seg.endMs,
     };
   };
@@ -3484,11 +3505,11 @@ function EffectChip({
       onMouseDown={beginDrag("move")}
       title={`${plugin.name} · ${Math.round(seg.intensity * 100)}% · click to drag, edges to resize`}
     >
-      <span className="handle left" onMouseDown={beginDrag("start")} />
+      {resizeStart && <span className="handle left" onMouseDown={beginDrag("start")} />}
       <span className="body">
         <Ico.sparkles size={10} /> {plugin.name}
       </span>
-      <span className="handle right" onMouseDown={beginDrag("end")} />
+      {resizeEnd && <span className="handle right" onMouseDown={beginDrag("end")} />}
       <button
         className="del"
         onMouseDown={(e) => e.stopPropagation()}
@@ -3892,13 +3913,10 @@ function Timeline({
 
   // Zoom/effect segments live in source time; show them where their source
   // range lands in the edited sequence and map chip edits back to source.
-  const srcMsFromOut = (c: PlacedClip, outMs: number) =>
-    Math.max(0, Math.min(srcDuration * 1000, (c.srcStart + (outMs / 1000 - c.outStart) * c.speed) * 1000));
-  const mapChipPatch = <P extends { startMs?: number; endMs?: number }>(c: PlacedClip, patch: P): P => ({
-    ...patch,
-    ...(patch.startMs !== undefined ? { startMs: srcMsFromOut(c, patch.startMs) } : {}),
-    ...(patch.endMs !== undefined ? { endMs: srcMsFromOut(c, patch.endMs) } : {}),
-  });
+  const zoomSegmentsRef = useRef(zoomSegments);
+  zoomSegmentsRef.current = zoomSegments;
+  const effectSegmentsRef = useRef(effectSegments);
+  effectSegmentsRef.current = effectSegments;
   const srcSpanFromOut = (o: number, lenSec: number) => {
     const c = clips[clipIndexAtOut(clips, o)];
     if (!c) return null;
@@ -4418,6 +4436,8 @@ function Timeline({
                 leftPct={pctOf(pc.outStart)}
                 widthPct={pctOf(pc.outEnd - pc.outStart)}
                 totalMs={totalMs}
+                resizeStart={seg.startMs >= pc.clip.srcStart * 1000}
+                resizeEnd={seg.endMs <= pc.clip.srcEnd * 1000}
                 selected={selectedZoomId === seg.id}
                 onSelect={() => {
                   setSelectedZoomId(seg.id);
@@ -4425,8 +4445,8 @@ function Timeline({
                 }}
                 onUpdate={(patch) =>
                   setZoomSegments(
-                    zoomSegments.map((s) =>
-                      s.id === seg.id ? { ...s, ...mapChipPatch(pc.clip, patch) } : s,
+                    zoomSegmentsRef.current.map((s) =>
+                      s.id === seg.id ? { ...s, ...mapSegmentChipPatch(pc.clip, seg, patch, srcDuration) } : s,
                     ),
                   )
                 }
@@ -4488,6 +4508,8 @@ function Timeline({
                 leftPct={pctOf(pc.outStart)}
                 widthPct={pctOf(pc.outEnd - pc.outStart)}
                 totalMs={totalMs}
+                resizeStart={seg.startMs >= pc.clip.srcStart * 1000}
+                resizeEnd={seg.endMs <= pc.clip.srcEnd * 1000}
                 selected={selectedEffectId === seg.id}
                 onSelect={() => {
                   setSelectedEffectId(seg.id);
@@ -4495,8 +4517,8 @@ function Timeline({
                 }}
                 onUpdate={(patch) =>
                   setEffectSegments(
-                    effectSegments.map((s) =>
-                      s.id === seg.id ? { ...s, ...mapChipPatch(pc.clip, patch) } : s,
+                    effectSegmentsRef.current.map((s) =>
+                      s.id === seg.id ? { ...s, ...mapSegmentChipPatch(pc.clip, seg, patch, srcDuration) } : s,
                     ),
                   )
                 }
@@ -4756,6 +4778,13 @@ export function Editor({
 
   const [activeRail, setActiveRail] = useState("background");
   const [artifact, setArtifact] = useState<CaptureArtifact | null>(null);
+  const artifactGeneration = useRef(0);
+  const captionGeneration = artifactGeneration.current;
+  const setCaptions = (patch: Partial<CaptionsState>) => {
+    if (captionGeneration !== artifactGeneration.current) return;
+    setState((s) => captionGeneration === artifactGeneration.current
+      ? { ...s, captions: { ...s.captions, ...patch } } : s);
+  };
   const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [videoNaturalSize, setVideoNaturalSize] = useState<{ w: number; h: number } | null>(null);
   const [audioPeaks, setAudioPeaks] = useState<number[] | null>(null);
@@ -5124,6 +5153,7 @@ export function Editor({
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     native.onRecordingArtifact((a) => {
+      artifactGeneration.current += 1;
       setArtifact(a);
       setCurrentTime(0);
       setPlaying(false);
@@ -5640,8 +5670,6 @@ export function Editor({
       if (r) selectClip(r.rightId);
       return;
     }
-    setZoomSegments(splitSegmentsAt(zoomSegments, tMs));
-    setEffectSegments(splitSegmentsAt(effectSegments, tMs));
     const rc = cameraSrc ? splitCameraCut(camCuts, srcTimeRef.current) : null;
     if (rc) setCamCuts(rc.cuts);
     for (const row of audioRows) {
@@ -5732,6 +5760,7 @@ export function Editor({
       return;
     }
 
+    artifactGeneration.current += 1;
     setArtifact(project.artifact);
     histRebaseRef.current = true;
     const { trimStart = 0, trimEnd = 0, splits: _splits, ...editorState } = project.editorState;
@@ -5902,6 +5931,8 @@ export function Editor({
 
   const selectCamera = () => {
     setActiveRail("webcam");
+    setAudioPieceSel(null);
+    setSelectedEffectId(null);
     setSelectedZoomId(null);
     setSelectedAudioKey(null);
     setSelectedClipId(null);
@@ -6053,8 +6084,16 @@ export function Editor({
           effectSegments={effectSegments}
           setEffectSegments={setEffectSegments}
           selectedEffectSeg={selectedEffectSeg}
-          onSelectEffect={setSelectedEffectId}
+          onSelectEffect={(id) => {
+            setSelectedClipId(null);
+            setSelectedCamCutId(null);
+            setAudioPieceSel(null);
+            setSelectedAudioKey(null);
+            setSelectedZoomId(null);
+            setSelectedEffectId(id);
+          }}
           captionSources={captionSources}
+          setCaptions={setCaptions}
           onSeekSrc={seekToSrc}
         />
         <div
@@ -6098,7 +6137,10 @@ export function Editor({
                 enabled: state.camera.enabled,
                 cuts: camCuts,
                 selectedCutId: selectedCamCutId,
-                onSelectCut: setSelectedCamCutId,
+                onSelectCut: (id) => {
+                  if (id) selectCamera();
+                  setSelectedCamCutId(id);
+                },
                 onCuts: setCamCuts,
               }
             : null
@@ -6109,11 +6151,27 @@ export function Editor({
         setZoomSegments={setZoomSegments}
         cursorSidecar={cursorSidecar}
         selectedZoomId={selectedZoomId}
-        setSelectedZoomId={setSelectedZoomId}
+        setSelectedZoomId={(id) => {
+          if (id) {
+            setSelectedClipId(null);
+            setSelectedCamCutId(null);
+            setAudioPieceSel(null);
+            setSelectedAudioKey(null);
+          }
+          setSelectedZoomId(id);
+        }}
         effectSegments={effectSegments}
         setEffectSegments={setEffectSegments}
         selectedEffectId={selectedEffectId}
-        setSelectedEffectId={setSelectedEffectId}
+        setSelectedEffectId={(id) => {
+          if (id) {
+            setSelectedClipId(null);
+            setSelectedCamCutId(null);
+            setAudioPieceSel(null);
+            setSelectedAudioKey(null);
+          }
+          setSelectedEffectId(id);
+        }}
         onHover={handleTimelineHover}
         captionPages={captionPages}
         onCaptionPage={(t) => {
