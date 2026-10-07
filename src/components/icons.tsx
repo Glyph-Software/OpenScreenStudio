@@ -34,6 +34,8 @@ export const Ico = {
   sparkles: (p: IcoProps) => <Sv {...p}><path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3zM5 16l.7 2L8 18.7 5.7 19.4 5 22l-.7-2.6L2 18.7 4.3 18z"/></Sv>,
   chevDown: (p: IcoProps) => <Sv {...p}><path d="M6 9l6 6 6-6"/></Sv>,
   chevRight: (p: IcoProps) => <Sv {...p}><path d="M9 6l6 6-6 6"/></Sv>,
+  chevLeft: (p: IcoProps) => <Sv {...p}><path d="M15 6l-6 6 6 6"/></Sv>,
+  copy: (p: IcoProps) => <Sv {...p}><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></Sv>,
   sidebar: (p: IcoProps) => <Sv {...p}><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M14 5v14"/></Sv>,
   gauge: (p: IcoProps) => <Sv {...p}><path d="M3.5 18a10 10 0 1 1 17 0"/><path d="M12 13l4.5-4"/><circle cx="12" cy="13" r="1.4" fill="currentColor" stroke="none"/></Sv>,
   eye: (p: IcoProps) => <Sv {...p}><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></Sv>,

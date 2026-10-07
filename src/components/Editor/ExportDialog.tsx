@@ -3,6 +3,7 @@ import { Ico } from "../icons";
 import type { CaptureArtifact, CursorSidecar } from "../../lib/native";
 import type { ZoomSegment } from "../../lib/autoZoom";
 import type { EffectSegment } from "../../lib/effects";
+import { outDuration, type PlacedClip } from "../../lib/clips";
 import { computeFrameLayout, type CropRect } from "../../lib/compositor";
 import {
   estimateExport,
@@ -90,8 +91,7 @@ export function ExportDialog(props: {
   zoomEnabled: boolean;
   smoothing: number;
   effectSegments: EffectSegment[];
-  trimStart: number;
-  trimEnd: number;
+  clips: PlacedClip[];
   audioTracks: ExportAudioTrack[];
   camera: ExportCameraTrack | null;
   onClose: () => void;
@@ -146,10 +146,7 @@ export function ExportDialog(props: {
     [layout.ratio, resolution],
   );
 
-  const durationSec = Math.max(
-    0,
-    props.videoDurationSec - props.trimStart - props.trimEnd,
-  );
+  const durationSec = outDuration(props.clips);
   const est = useMemo(
     () =>
       estimateExport({
@@ -200,8 +197,7 @@ export function ExportDialog(props: {
       zoomEnabled: props.zoomEnabled,
       smoothing: props.smoothing,
       effectSegments: props.effectSegments,
-      trimStart: props.trimStart,
-      trimEnd: props.trimEnd,
+      clips: props.clips,
       audioTracks: props.audioTracks,
       camera: props.camera,
       viewportBox: box,

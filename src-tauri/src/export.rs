@@ -298,6 +298,27 @@ pub struct AudioTrackSpec {
     pub src_end: f64,
     pub delay: f64,
     pub gain: f64,
+    /// Playback speed of this piece (sped-up / slowed clips); 1 = realtime.
+    #[serde(default = "unit_tempo")]
+    pub tempo: f64,
+}
+
+fn unit_tempo() -> f64 {
+    1.0
+}
+
+/// atempo accepts 0.5..=100 per instance, so chain halvings for slower speeds.
+fn atempo_chain(tempo: f64) -> String {
+    let mut t = tempo.clamp(0.0625, 100.0);
+    let mut out = String::new();
+    while t < 0.5 {
+        out.push_str("atempo=0.5,");
+        t /= 0.5;
+    }
+    if (t - 1.0).abs() > 1e-6 {
+        out.push_str(&format!("atempo={t:.4},"));
+    }
+    out
 }
 
 /// Append the audio trim/gain/delay filter graph and stream maps. Audio
@@ -311,7 +332,7 @@ pub(crate) fn append_audio_mix_args(args: &mut Vec<String>, audio_tracks: &[Audi
     for (i, t) in audio_tracks.iter().enumerate() {
         let delay_ms = (t.delay.max(0.0) * 1000.0).round() as u64;
         fc.push_str(&format!(
-            "[{input}:a]atrim=start={s0:.3}:end={s1:.3},asetpts=PTS-STARTPTS,volume={g:.3},adelay={d}:all=1[a{i}];",
+            "[{input}:a]atrim=start={s0:.3}:end={s1:.3},asetpts=PTS-STARTPTS,{tempo}volume={g:.3},adelay={d}:all=1[a{i}];",
             input = i + 1,
             s0 = t.src_start.max(0.0),
             s1 = t.src_end.max(t.src_start),
@@ -319,6 +340,7 @@ pub(crate) fn append_audio_mix_args(args: &mut Vec<String>, audio_tracks: &[Audi
             // ffmpeg volume filter accepts them — soft-clipping risk is on the user.
             g = t.gain.clamp(0.0, 8.0),
             d = delay_ms,
+            tempo = atempo_chain(t.tempo),
         ));
     }
     if audio_tracks.len() == 1 {

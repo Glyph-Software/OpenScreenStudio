@@ -14,6 +14,7 @@ import {
 } from "./native";
 import type { ZoomSegment } from "./autoZoom";
 import type { EffectSegment } from "./effects";
+import { clipIndexAtOut, outDuration, outToSrc, type PlacedClip } from "./clips";
 import { resolveEffectParams } from "./effects";
 import {
   cameraAt,
@@ -32,8 +33,8 @@ export type ExportTarget = "file" | "clipboard";
 
 /**
  * One sidecar audio track with its editor state, as handed to the exporter.
- * Trims are timeline seconds (same convention as the clip trim: `trimStart`
- * cuts the head, `trimEnd` cuts from the end of the full recording).
+ * Trims are source seconds: `trimStart` cuts the head, `trimEnd` cuts from
+ * the end of the full recording.
  */
 export type ExportAudioTrack = {
   path: string;
@@ -174,8 +175,8 @@ export type ExportParams = {
   smoothing: number;
   /** Plugin-based timeline video effects (see lib/effects.ts). */
   effectSegments: EffectSegment[];
-  trimStart: number;
-  trimEnd: number;
+  /** The edited sequence (output order, per-clip speed/mute). */
+  clips: PlacedClip[];
   /**
    * Sidecar audio tracks to mix into the export. Empty when the recording
    * has none — the mp4's own soundtrack is used as a fallback then.
@@ -290,9 +291,7 @@ export async function exportVideo(
       loadWallpaperImg(wallpaperUrl),
     ]);
 
-    const start = Math.max(0, p.trimStart);
-    const end = Math.max(start, p.videoDurationSec - p.trimEnd);
-    const durSec = Math.max(1 / p.fps, end - start);
+    const durSec = Math.max(1 / p.fps, outDuration(p.clips));
     const totalFrames = Math.max(1, Math.round(durSec * p.fps));
 
     // GPU path: composite on WebGL2 and (for mp4) stream raw RGBA frames
@@ -342,7 +341,9 @@ export async function exportVideo(
         await native.exportCancel(sessionId);
         return { ok: false, canceled: true };
       }
-      const t = Math.min(end - 1e-3, start + i / p.fps);
+      const o = i / p.fps;
+      const clip = p.clips[clipIndexAtOut(p.clips, o)];
+      const t = Math.min(clip.srcEnd - 1e-3, outToSrc(clip, o));
       await seekVideo(video, t);
       if (cam) {
         const camT = Math.max(
@@ -457,10 +458,10 @@ export async function exportVideo(
       }
     });
 
-    // Map each audible track onto the exported window: read [srcStart,
-    // srcEnd] from the file and place it at `delay` seconds into the output.
-    // Track t=0 equals video t=0 by construction (the Rust side aligns the
-    // WAVs to the first video frame), so source and timeline times coincide.
+    // Map each audible track onto every clip: read the clip's source window
+    // (intersected with the track trim) and place it at the clip's output
+    // position, sped up by the clip speed. Track t=0 equals video t=0 by
+    // construction (the Rust side aligns the WAVs to the first video frame).
     let audioSpecs: AudioTrackSpec[] = [];
     if (p.format === "mp4") {
       const tracks: ExportAudioTrack[] =
@@ -473,19 +474,24 @@ export async function exportVideo(
             ];
       audioSpecs = tracks
         .filter((t) => !t.muted && t.gain > 0.001)
-        .map((t) => {
-          const s0 = Math.max(start, t.trimStart);
-          const s1 = Math.min(end, p.videoDurationSec - t.trimEnd);
-          if (s1 - s0 < 0.01) return null;
-          return {
-            path: t.path,
-            srcStart: s0,
-            srcEnd: s1,
-            delay: s0 - start,
-            gain: t.gain,
-          };
-        })
-        .filter((t): t is AudioTrackSpec => t !== null);
+        .flatMap((t) =>
+          p.clips
+            .filter((c) => !c.muted)
+            .map((c): AudioTrackSpec | null => {
+              const s0 = Math.max(c.srcStart, t.trimStart);
+              const s1 = Math.min(c.srcEnd, p.videoDurationSec - t.trimEnd);
+              if (s1 - s0 < 0.01) return null;
+              return {
+                path: t.path,
+                srcStart: s0,
+                srcEnd: s1,
+                delay: c.outStart + (s0 - c.srcStart) / c.speed,
+                gain: t.gain,
+                tempo: c.speed,
+              };
+            })
+            .filter((s): s is AudioTrackSpec => s !== null),
+        );
     }
 
     const finalPath = await native.exportFinish(sessionId, outPath, audioSpecs);

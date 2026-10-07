@@ -40,6 +40,28 @@ import {
   resolveEffectParams,
   type EffectSegment,
 } from "../../lib/effects";
+import {
+  SPEED_MAX,
+  SPEED_MIN,
+  SPEED_PRESETS,
+  MIN_CLIP_SEC,
+  clampSpeed,
+  mapSegmentPiecePatch,
+  clipIndexAtOut,
+  duplicateClip,
+  fullClip,
+  layoutClips,
+  moveClip,
+  outDuration,
+  outToSrc,
+  patchClip,
+  removeClip,
+  splitAt,
+  srcRangePieces,
+  srcToOut,
+  type Clip,
+  type PlacedClip,
+} from "../../lib/clips";
 import { ExportDialog } from "./ExportDialog";
 
 /**
@@ -231,9 +253,8 @@ type EditorState = {
   padding: number;
   cropRect: CropRect | null;
   zoom: number;
-  trimStart: number;
-  trimEnd: number;
-  splits: number[];
+  /** Edited sequence in output order; empty = the whole recording, untouched. */
+  clips: Clip[];
   audioTracks: Record<AudioTrackKey, AudioTrackState>;
   camera: CameraState;
 };
@@ -242,14 +263,17 @@ const ASPECT_ORDER: AspectKey[] = ["16:9", "1:1", "9:16", "system"];
 
 type StatePatch = Partial<EditorState>;
 
-const PROJECT_VERSION = 3;
+const PROJECT_VERSION = 4;
+
+/** Pre-v4 projects stored a single head/tail trim instead of clips. */
+type LegacyTrim = { trimStart?: number; trimEnd?: number; splits?: number[] };
 
 /** On-disk shape of a `.openscreen` project file. */
 type ProjectFile = {
   version: number;
   app: "OpenScreen Studio";
   artifact: CaptureArtifact;
-  editorState: EditorState;
+  editorState: EditorState & LegacyTrim;
   zoomSettings: ZoomSettings;
   zoomSegments: ZoomSegment[];
   /** v3+ — plugin-based timeline video effects; absent in older saves. */
@@ -1367,6 +1391,129 @@ function EffectSegmentPanel({
   );
 }
 
+type ClipPanelProps = {
+  clip: PlacedClip;
+  index: number;
+  count: number;
+  onPatch: (patch: Partial<Clip>) => void;
+  onSplit: () => void;
+  onDelete: () => void;
+  onDuplicate: () => void;
+  onMove: (dir: -1 | 1) => void;
+};
+
+const fmtClock = (s: number) => {
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, "0")}:${(s - m * 60).toFixed(1).padStart(4, "0")}`;
+};
+const fmtSpeed = (x: number) => `${Number(x.toFixed(2))}×`;
+
+function ClipPanel({ clip, index, count, onPatch, onSplit, onDelete, onDuplicate, onMove }: ClipPanelProps) {
+  const [speedText, setSpeedText] = useState(String(clip.speed));
+  useEffect(() => setSpeedText(String(Number(clip.speed.toFixed(2)))), [clip.speed]);
+  const commitSpeed = () => {
+    const v = parseFloat(speedText.replace(",", "."));
+    if (Number.isFinite(v)) onPatch({ speed: clampSpeed(v) });
+    else setSpeedText(String(clip.speed));
+  };
+
+  return (
+    <div className="section clip-panel">
+      <h3 className="section-title">
+        <Ico.film size={15} /> Clip {index + 1} <span className="clip-panel-of">of {count}</span>
+      </h3>
+      <div className="clip-panel-facts">
+        <div>
+          <span>Source</span>
+          {fmtClock(clip.srcStart)} → {fmtClock(clip.srcEnd)}
+        </div>
+        <div>
+          <span>On timeline</span>
+          {fmtClock(clip.outEnd - clip.outStart)}
+        </div>
+      </div>
+
+      <div className="label-row label-strong" style={{ marginTop: 18 }}>
+        Speed · {fmtSpeed(clip.speed)}
+      </div>
+      <div className="clip-speed-grid">
+        {SPEED_PRESETS.map((x) => (
+          <button
+            key={x}
+            className={`clip-speed-btn ${Math.abs(clip.speed - x) < 1e-6 ? "active" : ""}`}
+            onClick={() => onPatch({ speed: x })}
+          >
+            {fmtSpeed(x)}
+          </button>
+        ))}
+      </div>
+      <div className="clip-speed-custom">
+        <span>Custom</span>
+        <input
+          type="text"
+          inputMode="decimal"
+          value={speedText}
+          onChange={(e) => setSpeedText(e.target.value)}
+          onBlur={commitSpeed}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          }}
+          aria-label="Custom speed"
+        />
+        <span>× ({SPEED_MIN}–{SPEED_MAX})</span>
+      </div>
+
+      <div className="row-toggle" style={{ marginTop: 18 }}>
+        <div className="col">
+          <div className="label">Mute audio</div>
+          <div className="desc">
+            Silences every audio track while this clip plays. Handy for timelapses, since sped-up
+            audio also plays faster.
+          </div>
+        </div>
+        <button
+          className={`switch ${clip.muted ? "on" : ""}`}
+          onClick={() => onPatch({ muted: !clip.muted })}
+          role="switch"
+          aria-checked={clip.muted}
+          aria-label="Mute clip audio"
+        />
+      </div>
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>
+        Edit
+      </div>
+      <div className="clip-actions">
+        <button className="btn-wide" onClick={onSplit} title="Split at playhead (S)">
+          <Ico.scissors size={12} /> Split at playhead
+        </button>
+        <button className="btn-wide" onClick={onDuplicate}>
+          <Ico.copy size={12} /> Duplicate
+        </button>
+        <div className="clip-actions-row">
+          <button className="btn-wide" onClick={() => onMove(-1)} disabled={index === 0}>
+            <Ico.chevLeft size={12} /> Move earlier
+          </button>
+          <button className="btn-wide" onClick={() => onMove(1)} disabled={index === count - 1}>
+            Move later <Ico.chevRight size={12} />
+          </button>
+        </div>
+        <button
+          className="btn-wide clip-delete"
+          onClick={onDelete}
+          disabled={count <= 1}
+          title={count <= 1 ? "The last clip can't be deleted" : "Delete clip (⌫)"}
+        >
+          <Ico.trash size={12} /> Delete clip
+        </button>
+      </div>
+      <div className="helper-text" style={{ marginTop: 14 }}>
+        Drag a clip to reorder it. Drag its edges to trim. The gap closes automatically.
+      </div>
+    </div>
+  );
+}
+
 function AudioPanel({
   rows,
   onChange,
@@ -1600,7 +1747,9 @@ function Inspector({
   setEffectSegments,
   selectedEffectSeg,
   onSelectEffect,
+  clipPanel,
 }: {
+  clipPanel: ClipPanelProps | null;
   active: string;
   state: EditorState;
   set: (p: StatePatch) => void;
@@ -1626,7 +1775,9 @@ function Inspector({
 }) {
   return (
     <aside className="inspector">
-      {selectedSeg ? (
+      {clipPanel ? (
+        <ClipPanel {...clipPanel} />
+      ) : selectedSeg ? (
         <ZoomSegmentPanel
           seg={selectedSeg}
           setSegments={setZoomSegments}
@@ -2385,9 +2536,11 @@ function Viewport({
   cameraVideoRef,
   onCameraTransform,
   onCameraSelect,
+  onSplit,
 }: {
   state: EditorState;
   set: (p: StatePatch) => void;
+  onSplit: () => void;
   onPlayToggle: () => void;
   onCrop: () => void;
   playing: boolean;
@@ -2515,11 +2668,8 @@ function Viewport({
         <div className="right">
           <button
             className="transport-btn"
-            title="Split clip at playhead"
-            onClick={() => {
-              if (state.splits.includes(currentTime)) return;
-              set({ splits: [...state.splits, currentTime].sort((a, b) => a - b) });
-            }}
+            title="Split clip at playhead (S)"
+            onClick={onSplit}
           >
             <Ico.scissors size={16} />
           </button>
@@ -2565,11 +2715,12 @@ function ZoomChip({
   onSelect: () => void;
 }) {
   const dragMode = useRef<null | "move" | "start" | "end">(null);
-  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number }>({
+  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number; lengthMs: number }>({
     trackWidth: 0,
     trackLeft: 0,
     startMs: 0,
     endMs: 0,
+    lengthMs: 0,
   });
 
   useEffect(() => {
@@ -2590,7 +2741,7 @@ function ZoomChip({
         // move: dxMs is the cursor's *absolute* position; preserve relative offset.
         // Recompute using delta from drag origin.
         const grabOffset = dragRef.current.startMs;
-        const len = endMs - startMs;
+        const len = dragRef.current.lengthMs;
         let newStart = dxMs - grabOffset;
         newStart = Math.max(0, Math.min(totalMs - len, newStart));
         onUpdate({ startMs: newStart, endMs: newStart + len });
@@ -2621,6 +2772,7 @@ function ZoomChip({
       trackLeft: rect.left,
       startMs: mode === "move" ? grab : seg.startMs,
       endMs: seg.endMs,
+      lengthMs: seg.endMs - seg.startMs,
     };
   };
 
@@ -2683,11 +2835,12 @@ function EffectChip({
   onSelect: () => void;
 }) {
   const dragMode = useRef<null | "move" | "start" | "end">(null);
-  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number }>({
+  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number; lengthMs: number }>({
     trackWidth: 0,
     trackLeft: 0,
     startMs: 0,
     endMs: 0,
+    lengthMs: 0,
   });
 
   useEffect(() => {
@@ -2706,7 +2859,7 @@ function EffectChip({
         onUpdate({ endMs: next });
       } else {
         const grabOffset = dragRef.current.startMs;
-        const len = endMs - startMs;
+        const len = dragRef.current.lengthMs;
         let newStart = dxMs - grabOffset;
         newStart = Math.max(0, Math.min(totalMs - len, newStart));
         onUpdate({ startMs: newStart, endMs: newStart + len });
@@ -2737,6 +2890,7 @@ function EffectChip({
       trackLeft: rect.left,
       startMs: mode === "move" ? grab : seg.startMs,
       endMs: seg.endMs,
+      lengthMs: seg.endMs - seg.startMs,
     };
   };
 
@@ -2789,12 +2943,16 @@ const AUDIO_ROW_H = 36;
 function AudioTrackRow({
   info,
   total,
+  clips,
+  srcTotal,
   selected,
   onSelect,
   onChange,
 }: {
   info: AudioRowInfo;
   total: number;
+  clips: PlacedClip[];
+  srcTotal: number;
   selected: boolean;
   onSelect: () => void;
   onChange: (patch: Partial<AudioTrackState>) => void;
@@ -2816,11 +2974,14 @@ function AudioTrackRow({
     const MIN_GAP = 0.05;
     const move = (ev: MouseEvent) => {
       const frac = Math.max(0, Math.min(1, (ev.clientX - r.left) / Math.max(1, r.width)));
-      const t = frac * total;
+      const o = frac * total;
+      const c = clips[clipIndexAtOut(clips, o)];
+      if (!c) return;
+      const t = outToSrc(c, o);
       if (side === "start") {
-        onChange({ trimStart: Math.max(0, Math.min(t, total - track.trimEnd - MIN_GAP)) });
+        onChange({ trimStart: Math.max(0, Math.min(t, srcTotal - track.trimEnd - MIN_GAP)) });
       } else {
-        onChange({ trimEnd: Math.max(0, Math.min(total - t, total - track.trimStart - MIN_GAP)) });
+        onChange({ trimEnd: Math.max(0, Math.min(srcTotal - t, srcTotal - track.trimStart - MIN_GAP)) });
       }
     };
     move(e.nativeEvent);
@@ -2832,8 +2993,32 @@ function AudioTrackRow({
     window.addEventListener("mouseup", up);
   };
 
-  const startPct = (track.trimStart / total) * 100;
-  const endPct = ((total - track.trimEnd) / total) * 100;
+  // The waveform, trim shades and handles are drawn in output (edited) time.
+  const outTotal = outDuration(clips);
+  const peaks = useMemo(() => {
+    const src = info.peaks;
+    if (!src || src.length === 0) return src;
+    const n = src.length;
+    return Array.from({ length: n }, (_, j) => {
+      const o = ((j + 0.5) / n) * outTotal;
+      const c = clips[clipIndexAtOut(clips, o)];
+      if (!c || c.muted) return 0;
+      return src[Math.min(n - 1, Math.floor((outToSrc(c, o) / Math.max(1e-6, srcTotal)) * n))] ?? 0;
+    });
+  }, [info.peaks, clips, outTotal, srcTotal]);
+  const trimEndSrc = srcTotal - track.trimEnd;
+  const firstOut = clips
+    .filter((c) => c.srcEnd >= track.trimStart)
+    .map((c) => srcToOut(c, Math.max(track.trimStart, c.srcStart)));
+  const lastOut = clips
+    .filter((c) => c.srcStart <= trimEndSrc)
+    .map((c) => srcToOut(c, Math.min(trimEndSrc, c.srcEnd)));
+  const startPct = ((firstOut.length ? Math.min(...firstOut) : 0) / total) * 100;
+  const endPct = ((lastOut.length ? Math.max(...lastOut) : outTotal) / total) * 100;
+  const shades = [
+    ...(track.trimStart > 0 ? srcRangePieces(clips, 0, track.trimStart) : []),
+    ...(track.trimEnd > 0 ? srcRangePieces(clips, trimEndSrc, srcTotal) : []),
+  ];
 
   return (
     <div
@@ -2843,24 +3028,28 @@ function AudioTrackRow({
       onClick={onSelect}
     >
       <div className={`audio-block ${info.key} ${track.muted ? "muted" : ""}`}>
-        {info.peaks && info.peaks.length > 0 ? (
+        {peaks && peaks.length > 0 ? (
           <svg
             className="waveform"
-            viewBox={`0 0 ${info.peaks.length} ${AUDIO_ROW_H}`}
+            viewBox={`0 0 ${peaks.length} ${AUDIO_ROW_H}`}
             preserveAspectRatio="none"
-            style={{ width: "100%" }}
+            style={{ width: `${(outTotal / total) * 100}%` }}
           >
-            <path d={buildWavePath(info.peaks, AUDIO_ROW_H)} fill="rgba(255,255,255,0.6)" />
+            <path d={buildWavePath(peaks, AUDIO_ROW_H)} fill="rgba(255,255,255,0.6)" />
           </svg>
         ) : (
           <div className="audio-silent">silence</div>
         )}
-        {track.trimStart > 0 && (
-          <div className="audio-trim-shade" style={{ left: 0, width: `${startPct}%` }} />
-        )}
-        {track.trimEnd > 0 && (
-          <div className="audio-trim-shade" style={{ right: 0, width: `${100 - endPct}%` }} />
-        )}
+        {shades.map((pc, i) => (
+          <div
+            key={i}
+            className="audio-trim-shade"
+            style={{
+              left: `${(pc.outStart / total) * 100}%`,
+              width: `${((pc.outEnd - pc.outStart) / total) * 100}%`,
+            }}
+          />
+        ))}
         <button
           className="audio-mute"
           onMouseDown={(e) => e.stopPropagation()}
@@ -2895,11 +3084,13 @@ function Timeline({
   duration,
   currentTime,
   setCurrentTime,
-  trimStart,
-  trimEnd,
-  onTrimStart,
-  onTrimEnd,
-  splits,
+  clips,
+  srcDuration,
+  selectedClipId,
+  onSelectClip,
+  onClipPatch,
+  onMoveClip,
+  onPreviewSource,
   zoom,
   setZoom,
   playing,
@@ -2925,11 +3116,13 @@ function Timeline({
   duration: number;
   currentTime: number;
   setCurrentTime: (v: number) => void;
-  trimStart: number;
-  trimEnd: number;
-  onTrimStart: () => void;
-  onTrimEnd: () => void;
-  splits: number[];
+  clips: PlacedClip[];
+  srcDuration: number;
+  selectedClipId: string | null;
+  onSelectClip: (id: string | null) => void;
+  onClipPatch: (id: string, patch: Partial<Clip>) => void;
+  onMoveClip: (id: string, toIndex: number) => void;
+  onPreviewSource: (t: number | null) => void;
   zoom: number;
   setZoom: (v: number) => void;
   playing: boolean;
@@ -2960,8 +3153,10 @@ function Timeline({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const ref = useRef<HTMLDivElement | null>(null);
   const [hoverT, setHoverT] = useState<number | null>(null);
+  // Trim drags freeze the time scale so the timeline doesn't rescale under the cursor.
+  const [frozenTotal, setFrozenTotal] = useState<number | null>(null);
 
-  const TOTAL = Math.max(duration, 0.0001);
+  const TOTAL = Math.max(frozenTotal ?? duration, 0.0001);
   const pctOf = (t: number) => (t / TOTAL) * 100;
 
   // Layout insets — the timeline carves out a sticky left "gutter" column for
@@ -3057,6 +3252,80 @@ function Timeline({
     }
   };
 
+  // Zoom/effect segments live in source time; show them where their source
+  // range lands in the edited sequence and map chip edits back to source.
+  const srcSpanFromOut = (o: number, lenSec: number) => {
+    const c = clips[clipIndexAtOut(clips, o)];
+    if (!c) return null;
+    return {
+      startMs: outToSrc(c, o) * 1000,
+      endMs: outToSrc(c, Math.min(o + lenSec, c.outEnd)) * 1000,
+    };
+  };
+
+  const clipTrackRef = useRef<HTMLDivElement | null>(null);
+  const [clipDrag, setClipDrag] = useState<{ id: string; dx: number; target: number } | null>(null);
+  const beginClipDrag = (c: PlacedClip, mode: "move" | "start" | "end") => (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onSelectClip(c.id);
+    const track = clipTrackRef.current;
+    if (!track) return;
+    const r = track.getBoundingClientRect();
+    const total = TOTAL;
+    const secPerPx = total / Math.max(1, r.width);
+    const x0 = e.clientX;
+    const others = clips.filter((k) => k.id !== c.id);
+    const targetAt = (clientX: number) => {
+      const o = ((clientX - r.left) / r.width) * total;
+      return others.filter((k) => (k.outStart + k.outEnd) / 2 < o).length;
+    };
+    let moved = false;
+    if (mode !== "move") setFrozenTotal(total);
+    const move = (ev: MouseEvent) => {
+      const dx = ev.clientX - x0;
+      if (mode === "move") {
+        if (!moved && Math.abs(dx) < 4) return;
+        moved = true;
+        setClipDrag({ id: c.id, dx, target: targetAt(ev.clientX) });
+        return;
+      }
+      const d = dx * secPerPx * c.speed;
+      const t =
+        mode === "start"
+          ? Math.max(0, Math.min(c.srcEnd - MIN_CLIP_SEC, c.srcStart + d))
+          : Math.min(srcDuration, Math.max(c.srcStart + MIN_CLIP_SEC, c.srcEnd + d));
+      onClipPatch(c.id, mode === "start" ? { srcStart: t } : { srcEnd: t });
+      onPreviewSource(t);
+    };
+    const up = (ev: MouseEvent) => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      if (mode === "move") {
+        setClipDrag(null);
+        if (moved) {
+          const to = targetAt(ev.clientX);
+          if (to !== clips.findIndex((k) => k.id === c.id)) onMoveClip(c.id, to);
+        } else {
+          setCurrentTime(Math.max(0, Math.min(duration, ((ev.clientX - r.left) / r.width) * total)));
+        }
+      } else {
+        setFrozenTotal(null);
+        onPreviewSource(null);
+      }
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+  const insertAt =
+    clipDrag === null
+      ? null
+      : (() => {
+          const others = clips.filter((k) => k.id !== clipDrag.id);
+          return clipDrag.target === 0 ? 0 : others[clipDrag.target - 1].outEnd;
+        })();
+
   // Manual zoom authoring: hovering the zoom track shows a ghost 1s block
   // with a "+"; clicking it commits a real manual segment from that point.
   const zoomTrackRef = useRef<HTMLDivElement | null>(null);
@@ -3093,9 +3362,9 @@ function Timeline({
     if (e.button !== 0) return;
     const t = zoomGhostFromX(e.clientX);
     if (t === null) return;
-    const startMs = t * 1000;
-    const endMs = Math.min(TOTAL, t + MANUAL_ZOOM_SEC) * 1000;
-    if (endMs - startMs < 1) return;
+    const span = srcSpanFromOut(t, MANUAL_ZOOM_SEC);
+    if (!span || span.endMs - span.startMs < 1) return;
+    const { startMs, endMs } = span;
     const seg: ZoomSegment = {
       id: `seg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
       startMs,
@@ -3148,10 +3417,9 @@ function Timeline({
     if (e.button !== 0) return;
     const t = effectGhostFromX(e.clientX);
     if (t === null) return;
-    const startMs = t * 1000;
-    const endMs = Math.min(TOTAL, t + DEFAULT_EFFECT_DURATION_SEC) * 1000;
-    if (endMs - startMs < 1) return;
-    const seg = newEffectSegment(startMs, endMs);
+    const span = srcSpanFromOut(t, DEFAULT_EFFECT_DURATION_SEC);
+    if (!span || span.endMs - span.startMs < 1) return;
+    const seg = newEffectSegment(span.startMs, span.endMs);
     setEffectSegments(
       [...effectSegments, seg].sort((a, b) => a.startMs - b.startMs),
     );
@@ -3289,174 +3557,125 @@ function Timeline({
               style={{ left: `${(s / TOTAL) * 100}%` }}
             />
           ))}
-        <div className="tl-track" style={{ position: "relative" }}>
-          <div
-            className="scissor-mark left"
-            title="Set trim start to playhead"
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation();
-              onTrimStart();
-            }}
-            style={{ cursor: "pointer" }}
-          >
-            <Ico.scissors size={10} />
-            <div style={{ marginTop: 1 }}>{trimStart.toFixed(1)}s</div>
-          </div>
-          <div
-            className="scissor-mark right"
-            title="Set trim end to playhead"
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation();
-              onTrimEnd();
-            }}
-            style={{ cursor: "pointer" }}
-          >
-            <Ico.scissors size={10} />
-            <div style={{ marginTop: 1 }}>{trimEnd.toFixed(1)}s</div>
-          </div>
-          <div className="clip-block" style={{ left: 0, right: 0, width: "auto" }}>
-            {splits.map((t) => (
+        <div className="tl-track clips" ref={clipTrackRef} style={{ position: "relative" }}>
+          {clips.map((c, i) => {
+            const dragging = clipDrag?.id === c.id;
+            const len = c.outEnd - c.outStart;
+            const peaks =
+              audioPeaks && audioPeaks.length > 0
+                ? audioPeaks.slice(
+                    Math.floor((c.srcStart / srcDuration) * audioPeaks.length),
+                    Math.max(
+                      Math.floor((c.srcStart / srcDuration) * audioPeaks.length) + 1,
+                      Math.ceil((c.srcEnd / srcDuration) * audioPeaks.length),
+                    ),
+                  )
+                : null;
+            return (
               <div
-                key={t}
+                key={c.id}
+                className={`clip-block ${selectedClipId === c.id ? "selected" : ""} ${
+                  dragging ? "dragging" : ""
+                } ${c.speed !== 1 ? "sped" : ""} ${c.muted ? "muted" : ""}`}
                 style={{
-                  position: "absolute",
-                  top: 0,
-                  bottom: 0,
-                  left: `${(t / TOTAL) * 100}%`,
-                  width: 2,
-                  background: "rgba(255,255,255,0.95)",
-                  boxShadow: "0 0 4px rgba(0,0,0,0.6)",
-                  pointerEvents: "none",
-                  zIndex: 3,
+                  left: `${pctOf(c.outStart)}%`,
+                  width: `${pctOf(len)}%`,
+                  transform: dragging ? `translateX(${clipDrag.dx}px)` : undefined,
                 }}
-              />
-            ))}
-            {(trimStart > 0 || trimEnd > 0) && (
-              <>
-                {trimStart > 0 && (
-                  <div
-                    style={{
-                      position: "absolute",
-                      top: 0,
-                      bottom: 0,
-                      left: 0,
-                      width: `${(trimStart / TOTAL) * 100}%`,
-                      background: "rgba(0,0,0,0.55)",
-                      pointerEvents: "none",
-                      zIndex: 2,
-                    }}
-                  />
-                )}
-                {trimEnd > 0 && (
-                  <div
-                    style={{
-                      position: "absolute",
-                      top: 0,
-                      bottom: 0,
-                      right: 0,
-                      width: `${(trimEnd / TOTAL) * 100}%`,
-                      background: "rgba(0,0,0,0.55)",
-                      pointerEvents: "none",
-                      zIndex: 2,
-                    }}
-                  />
-                )}
-              </>
-            )}
-            {audioPeaks && audioPeaks.length > 0 && (
-              <svg
-                className="waveform"
-                viewBox={`0 0 ${audioPeaks.length} 56`}
-                preserveAspectRatio="none"
-                style={{ width: "100%" }}
+                onMouseDown={beginClipDrag(c, "move")}
+                title={`Clip ${i + 1} · ${fmtSpeed(c.speed)} · drag to reorder, edges to trim`}
               >
-                <path d={buildWavePath(audioPeaks, 56)} fill="rgba(255,255,255,0.55)" />
-              </svg>
-            )}
-            <div className="stack">
-              <div className="label-pill">
-                <Ico.film size={11} /> Clip
+                {peaks && peaks.length > 0 && (
+                  <svg
+                    className="waveform"
+                    viewBox={`0 0 ${peaks.length} 56`}
+                    preserveAspectRatio="none"
+                    style={{ width: "100%" }}
+                  >
+                    <path d={buildWavePath(peaks, 56)} fill="rgba(255,255,255,0.55)" />
+                  </svg>
+                )}
+                <div className="stack">
+                  <div className="label-pill">
+                    <Ico.film size={11} /> Clip {i + 1}
+                  </div>
+                  <div className="meta">
+                    <span>{len >= 60 ? fmt(len) : `${len.toFixed(1)}s`}</span>
+                    {c.speed !== 1 && (
+                      <span className="clip-speed-tag">
+                        <Ico.speedo size={10} /> {fmtSpeed(c.speed)}
+                      </span>
+                    )}
+                    {c.muted && <Ico.audioMuted size={10} />}
+                  </div>
+                </div>
+                <span
+                  className="clip-handle left"
+                  onMouseDown={beginClipDrag(c, "start")}
+                  title="Drag to trim the clip start"
+                />
+                <span
+                  className="clip-handle right"
+                  onMouseDown={beginClipDrag(c, "end")}
+                  title="Drag to trim the clip end"
+                />
               </div>
-              <div className="meta">
-                <span>
-                  <Ico.audio size={10} /> {fmt(Math.max(0, duration - trimStart - trimEnd))}
-                </span>
-                <span>
-                  <Ico.speedo size={10} /> 1×
-                </span>
-              </div>
-            </div>
-            <div
-              style={{
-                position: "absolute",
-                left: 8,
-                bottom: 6,
-                fontSize: 9,
-                color: "rgba(255,255,255,0.7)",
-                fontVariantNumeric: "tabular-nums",
-              }}
-            >
-              {fmt(trimStart)}
-            </div>
-            <div
-              style={{
-                position: "absolute",
-                right: 8,
-                bottom: 6,
-                fontSize: 9,
-                color: "rgba(255,255,255,0.7)",
-                fontVariantNumeric: "tabular-nums",
-              }}
-            >
-              {fmt(duration - trimEnd)}
-            </div>
-          </div>
+            );
+          })}
+          {insertAt !== null && (
+            <div className="clip-insert" style={{ left: `${pctOf(insertAt)}%` }} />
+          )}
         </div>
 
         {cameraRow && (() => {
           // Camera clip span on the shared timeline (clamped). A zero
           // duration (metadata not loaded yet / bubble hidden) falls back to
           // the full remaining range so the row never vanishes.
-          const start = Math.max(0, Math.min(TOTAL, cameraRow.offset));
-          const rawEnd = cameraRow.duration > 0 ? cameraRow.offset + cameraRow.duration : TOTAL;
-          const end = Math.max(start, Math.min(TOTAL, rawEnd));
+          const start = Math.max(0, cameraRow.offset);
+          const rawEnd = cameraRow.duration > 0 ? cameraRow.offset + cameraRow.duration : srcDuration;
+          const pieces = srcRangePieces(clips, start, Math.max(start, rawEnd));
           return (
             <div className="tl-track camera" style={{ position: "relative" }}>
-              <div
-                className={`camera-track-block ${cameraRow.enabled ? "" : "off"}`}
-                style={{
-                  left: `${(start / TOTAL) * 100}%`,
-                  width: `${(Math.max(0.01, end - start) / TOTAL) * 100}%`,
-                }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onSelectCamera();
-                }}
-                title={cameraRow.enabled ? "Camera track" : "Camera hidden"}
-              >
-                <Ico.webcam size={11} />
-                <span>Camera</span>
-              </div>
-              {cameraRow.keyframes.map((kf) => (
+              {pieces.map((pc) => (
                 <div
-                  key={kf.t}
-                  className="camera-kf"
-                  style={{ left: `${(Math.min(TOTAL, Math.max(0, kf.t)) / TOTAL) * 100}%` }}
-                  title="Position keyframe — click to jump, ⌥-click to delete"
-                  onMouseDown={(e) => e.stopPropagation()}
+                  key={pc.clip.id}
+                  className={`camera-track-block ${cameraRow.enabled ? "" : "off"}`}
+                  style={{
+                    left: `${pctOf(pc.outStart)}%`,
+                    width: `${pctOf(Math.max(0.01, pc.outEnd - pc.outStart))}%`,
+                  }}
                   onClick={(e) => {
                     e.stopPropagation();
-                    if (e.altKey) {
-                      onRemoveCameraKeyframe(kf.t);
-                    } else {
-                      setCurrentTime(kf.t);
-                      onSelectCamera();
-                    }
+                    onSelectCamera();
                   }}
-                />
+                  title={cameraRow.enabled ? "Camera track" : "Camera hidden"}
+                >
+                  <Ico.webcam size={11} />
+                  <span>Camera</span>
+                </div>
               ))}
+              {cameraRow.keyframes.flatMap((kf) =>
+                clips
+                  .filter((c) => kf.t >= c.srcStart && kf.t <= c.srcEnd)
+                  .map((c) => (
+                    <div
+                      key={`${kf.t}-${c.id}`}
+                      className="camera-kf"
+                      style={{ left: `${pctOf(srcToOut(c, kf.t))}%` }}
+                      title="Position keyframe — click to jump, ⌥-click to delete"
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (e.altKey) {
+                          onRemoveCameraKeyframe(kf.t);
+                        } else {
+                          setCurrentTime(srcToOut(c, kf.t));
+                          onSelectCamera();
+                        }
+                      }}
+                    />
+                  )),
+              )}
             </div>
           );
         })()}
@@ -3466,6 +3685,8 @@ function Timeline({
             key={row.key}
             info={row}
             total={TOTAL}
+            clips={clips}
+            srcTotal={srcDuration}
             selected={selectedAudioKey === row.key}
             onSelect={() => setSelectedAudioKey(row.key)}
             onChange={(patch) => onAudioTrack(row.key, patch)}
@@ -3511,22 +3732,15 @@ function Timeline({
               <Ico.plus size={12} />
             </div>
           )}
-          {zoomSegments.map((seg) => {
+          {zoomSegments.flatMap((seg) =>
+            srcRangePieces(clips, seg.startMs / 1000, seg.endMs / 1000).map((pc) => {
             const totalMs = TOTAL * 1000;
-            // Clamp the displayed range so a segment whose endMs lands past
-            // the video's duration (e.g. cursor sidecar slightly longer than
-            // the trimmed clip) doesn't overflow .tl-tracks and get clipped
-            // at the right edge at max zoom out.
-            const startMs = Math.max(0, Math.min(totalMs, seg.startMs));
-            const endMs = Math.max(startMs, Math.min(totalMs, seg.endMs));
-            const left = (startMs / Math.max(1, totalMs)) * 100;
-            const width = ((endMs - startMs) / Math.max(1, totalMs)) * 100;
             return (
               <ZoomChip
-                key={seg.id}
-                seg={seg}
-                leftPct={left}
-                widthPct={width}
+                key={`${seg.id}-${pc.clip.id}`}
+                seg={{ ...seg, startMs: pc.outStart * 1000, endMs: pc.outEnd * 1000 }}
+                leftPct={pctOf(pc.outStart)}
+                widthPct={pctOf(pc.outEnd - pc.outStart)}
                 totalMs={totalMs}
                 selected={selectedZoomId === seg.id}
                 onSelect={() => {
@@ -3535,7 +3749,9 @@ function Timeline({
                 }}
                 onUpdate={(patch) =>
                   setZoomSegments(
-                    zoomSegments.map((s) => (s.id === seg.id ? { ...s, ...patch } : s)),
+                    zoomSegments.map((s) =>
+                      s.id === seg.id ? { ...s, ...mapSegmentPiecePatch(pc.clip, seg, pc.outStart * 1000, patch, srcDuration * 1000) } : s,
+                    ),
                   )
                 }
                 onDelete={() => {
@@ -3544,7 +3760,7 @@ function Timeline({
                 }}
               />
             );
-          })}
+          }))}
         </div>
 
         <div
@@ -3586,18 +3802,15 @@ function Timeline({
               <Ico.plus size={12} />
             </div>
           )}
-          {effectSegments.map((seg) => {
+          {effectSegments.flatMap((seg) =>
+            srcRangePieces(clips, seg.startMs / 1000, seg.endMs / 1000).map((pc) => {
             const totalMs = TOTAL * 1000;
-            const startMs = Math.max(0, Math.min(totalMs, seg.startMs));
-            const endMs = Math.max(startMs, Math.min(totalMs, seg.endMs));
-            const left = (startMs / Math.max(1, totalMs)) * 100;
-            const width = ((endMs - startMs) / Math.max(1, totalMs)) * 100;
             return (
               <EffectChip
-                key={seg.id}
-                seg={seg}
-                leftPct={left}
-                widthPct={width}
+                key={`${seg.id}-${pc.clip.id}`}
+                seg={{ ...seg, startMs: pc.outStart * 1000, endMs: pc.outEnd * 1000 }}
+                leftPct={pctOf(pc.outStart)}
+                widthPct={pctOf(pc.outEnd - pc.outStart)}
                 totalMs={totalMs}
                 selected={selectedEffectId === seg.id}
                 onSelect={() => {
@@ -3606,7 +3819,9 @@ function Timeline({
                 }}
                 onUpdate={(patch) =>
                   setEffectSegments(
-                    effectSegments.map((s) => (s.id === seg.id ? { ...s, ...patch } : s)),
+                    effectSegments.map((s) =>
+                      s.id === seg.id ? { ...s, ...mapSegmentPiecePatch(pc.clip, seg, pc.outStart * 1000, patch, srcDuration * 1000) } : s,
+                    ),
                   )
                 }
                 onDelete={() => {
@@ -3615,7 +3830,7 @@ function Timeline({
                 }}
               />
             );
-          })}
+          }))}
         </div>
 
           {hoverT !== null && (
@@ -3842,9 +4057,7 @@ export function Editor({
     padding: 56,
     cropRect: null,
     zoom: 0,
-    trimStart: 0,
-    trimEnd: 0,
-    splits: [],
+    clips: [],
     audioTracks: defaultAudioTracks(),
     camera: defaultCameraState(),
   });
@@ -3878,6 +4091,7 @@ export function Editor({
   );
   const [effectSegments, setEffectSegments] = useState<EffectSegment[]>([]);
   const [selectedEffectId, setSelectedEffectId] = useState<string | null>(null);
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const selectedEffectSeg = useMemo(
     () => findEffectSegment(effectSegments, selectedEffectId),
     [effectSegments, selectedEffectId],
@@ -3991,10 +4205,11 @@ export function Editor({
       if (e.key === "Escape") {
         setSelectedZoomId(null);
         setSelectedEffectId(null);
+        setSelectedClipId(null);
         return;
       }
       if (e.key !== "Delete" && e.key !== "Backspace") return;
-      if (!selectedZoomId && !selectedEffectId) return;
+      if (!selectedZoomId && !selectedEffectId && !selectedClipId) return;
       const t = e.target as HTMLElement | null;
       if (
         t &&
@@ -4013,17 +4228,24 @@ export function Editor({
         setEffectSegments(effectSegments.filter((s) => s.id !== selectedEffectId));
         setSelectedEffectId(null);
       }
+      if (selectedClipId && !selectedZoomId && !selectedEffectId) {
+        deleteClipRef.current(selectedClipId);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedZoomId, zoomSegments, setZoomSegments, selectedEffectId, effectSegments, setEffectSegments]);
+  }, [selectedZoomId, zoomSegments, setZoomSegments, selectedEffectId, effectSegments, setEffectSegments, selectedClipId]);
 
   // When a segment is selected, highlight the matching rail icon.
   useEffect(() => {
-    if (selectedZoomId) setActiveRail("cursor");
+    if (!selectedZoomId) return;
+    setActiveRail("cursor");
+    setSelectedClipId(null);
   }, [selectedZoomId]);
   useEffect(() => {
-    if (selectedEffectId) setActiveRail("effects");
+    if (!selectedEffectId) return;
+    setActiveRail("effects");
+    setSelectedClipId(null);
   }, [selectedEffectId]);
 
   // Default the canvas background to the user's current macOS desktop
@@ -4093,8 +4315,30 @@ export function Editor({
 
   // The demo timeline is 12s; once a real recording is loaded use its duration.
   const DEMO_DURATION = 12;
-  const duration = videoDuration ?? DEMO_DURATION;
+  // `srcDuration` is the raw recording; `duration` is the edited output.
+  const srcDuration = videoDuration ?? DEMO_DURATION;
+  const effClips = useMemo(
+    () => (state.clips.length > 0 ? state.clips : [fullClip(srcDuration)]),
+    [state.clips, srcDuration],
+  );
+  const placed = useMemo(() => layoutClips(effClips), [effClips]);
+  const duration = outDuration(placed);
+  const placedRef = useRef(placed);
+  placedRef.current = placed;
+  const playIdxRef = useRef(0);
+  const pendingLegacyTrimRef = useRef<{ trimStart: number; trimEnd: number } | null>(null);
   const [currentTime, setCurrentTime] = useState(2.4);
+  const srcAtOut = (o: number) => {
+    const pl = placedRef.current;
+    const c = pl[clipIndexAtOut(pl, o)];
+    return c ? outToSrc(c, o) : 0;
+  };
+  const srcTime = useMemo(() => {
+    const c = placed[clipIndexAtOut(placed, currentTime)];
+    return c ? outToSrc(c, currentTime) : 0;
+  }, [placed, currentTime]);
+  const srcTimeRef = useRef(srcTime);
+  srcTimeRef.current = srcTime;
   const [playing, setPlaying] = useState(false);
   const [cropOpen, setCropOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
@@ -4188,9 +4432,12 @@ export function Editor({
       // Per-track edits belong to the previous clip.
       setState((s) => ({
         ...s,
+        clips: [],
         audioTracks: defaultAudioTracks(),
         camera: defaultCameraState(),
       }));
+      pendingLegacyTrimRef.current = null;
+      setSelectedClipId(null);
       setEffectSegments([]);
       setSelectedEffectId(null);
       // A fresh recording: derive auto-zoom from its cursor sidecar.
@@ -4220,6 +4467,16 @@ export function Editor({
     if (!v || !videoSrc) return;
     const onMeta = () => {
       setVideoDuration(isFinite(v.duration) ? v.duration : null);
+      const legacy = pendingLegacyTrimRef.current;
+      if (legacy && isFinite(v.duration)) {
+        pendingLegacyTrimRef.current = null;
+        const end = Math.max(legacy.trimStart + MIN_CLIP_SEC, v.duration - legacy.trimEnd);
+        histRebaseRef.current = true;
+        setState((s) => ({
+          ...s,
+          clips: [{ ...fullClip(v.duration), srcStart: legacy.trimStart, srcEnd: end }],
+        }));
+      }
       if (v.videoWidth > 0 && v.videoHeight > 0) {
         setVideoNaturalSize({ w: v.videoWidth, h: v.videoHeight });
       }
@@ -4297,12 +4554,12 @@ export function Editor({
 
   const audioSyncRef = useRef({
     tracks: state.audioTracks,
-    duration,
+    duration: srcDuration,
     auto: { system: 1, mic: 1 },
   });
   audioSyncRef.current = {
     tracks: state.audioTracks,
-    duration,
+    duration: srcDuration,
     auto: { system: systemAutoGain, mic: micAutoGain },
   };
 
@@ -4327,6 +4584,7 @@ export function Editor({
         src: null as AudioBufferSourceNode | null,
         startCtxT: 0,
         startOffset: 0,
+        rate: 1,
       };
     });
     type Node = (typeof nodes)[number];
@@ -4339,11 +4597,14 @@ export function Editor({
       n.src.disconnect();
       n.src = null;
     };
+    const clipRate = () => placedRef.current[playIdxRef.current]?.speed ?? 1;
     const startNode = (n: Node, t: number) => {
       stopNode(n);
       if (t >= n.buf.duration) return; // past the end of this track
       const src = ctx.createBufferSource();
       src.buffer = n.buf;
+      n.rate = clipRate();
+      src.playbackRate.value = n.rate;
       src.connect(n.gain);
       src.start(0, Math.max(0, t));
       n.src = src;
@@ -4372,15 +4633,17 @@ export function Editor({
     const tick = () => {
       const { tracks, duration: dur, auto } = audioSyncRef.current;
       const t = v.currentTime;
+      const clip = placedRef.current[playIdxRef.current];
+      const rate = clip?.speed ?? 1;
       for (const n of nodes) {
         const ts = tracks[n.key];
         const inWindow = t >= ts.trimStart - 1e-3 && t <= dur - ts.trimEnd + 1e-3;
         const boost = ts.normalize ? auto[n.key] : 1;
         n.gain.gain.value =
-          ts.muted || !inWindow ? 0 : Math.max(0, Math.min(1, ts.gain)) * boost;
+          ts.muted || clip?.muted || !inWindow ? 0 : Math.max(0, Math.min(1, ts.gain)) * boost;
         if (!v.paused && n.src) {
-          const expected = n.startOffset + (ctx.currentTime - n.startCtxT);
-          if (Math.abs(expected - t) > 0.12) startNode(n, t);
+          const expected = n.startOffset + (ctx.currentTime - n.startCtxT) * n.rate;
+          if (n.rate !== rate || Math.abs(expected - t) > 0.12 * Math.max(1, rate)) startNode(n, t);
         }
       }
       raf = requestAnimationFrame(tick);
@@ -4427,7 +4690,8 @@ export function Editor({
     let raf = 0;
     const tick = () => {
       if (!v.paused) {
-        if (Math.abs(c.currentTime - camTime()) > 0.08) syncTime();
+        if (c.playbackRate !== v.playbackRate) c.playbackRate = v.playbackRate;
+        if (Math.abs(c.currentTime - camTime()) > 0.08 * Math.max(1, v.playbackRate)) syncTime();
         if (c.paused) void c.play().catch(() => {});
       }
       raf = requestAnimationFrame(tick);
@@ -4457,22 +4721,30 @@ export function Editor({
   }, [cameraSrc, state.camera.enabled]);
 
   // Drive playback / scrubbing on the real <video>.
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (videoSrc) {
-      if (playing) v.play().catch(() => {});
-      else v.pause();
-    }
-  }, [playing, videoSrc]);
-
+  // Starting playback positions the video on the clip under the playhead
+  // (or rewinds when parked at the end); the rAF loop below walks the clips.
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !videoSrc) return;
-    const onEnded = () => setPlaying(false);
-    v.addEventListener("ended", onEnded);
-    return () => v.removeEventListener("ended", onEnded);
-  }, [videoSrc]);
+    if (!playing) {
+      v.pause();
+      return;
+    }
+    isHoveringRef.current = false;
+    hoverWasPlayingRef.current = false;
+    const pl = placedRef.current;
+    let o = currentTimeRef.current;
+    if (o >= outDuration(pl) - 0.05) {
+      o = 0;
+      setCurrentTime(0);
+    }
+    const i = clipIndexAtOut(pl, o);
+    playIdxRef.current = i;
+    const t = outToSrc(pl[i], o);
+    if (Math.abs(v.currentTime - t) > 0.05) v.currentTime = t;
+    v.playbackRate = pl[i].speed;
+    v.play().catch(() => {});
+  }, [playing, videoSrc]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -4502,14 +4774,35 @@ export function Editor({
     if (!playing) {
       const onTime = () => {
         if (isHoveringRef.current) return;
-        setCurrentTime(v.currentTime);
+        const c = placedRef.current[playIdxRef.current];
+        if (!c || v.currentTime < c.srcStart - 0.05 || v.currentTime > c.srcEnd + 0.05) return;
+        setCurrentTime(srcToOut(c, v.currentTime));
       };
       v.addEventListener("timeupdate", onTime);
       return () => v.removeEventListener("timeupdate", onTime);
     }
     let raf = 0;
     const tick = () => {
-      if (!isHoveringRef.current) setCurrentTime(v.currentTime);
+      if (!isHoveringRef.current) {
+        const pl = placedRef.current;
+        let i = Math.min(playIdxRef.current, pl.length - 1);
+        let c = pl[i];
+        if (v.ended || v.currentTime >= c.srcEnd - 0.02 * c.speed) {
+          if (i + 1 >= pl.length) {
+            setPlaying(false);
+            setCurrentTime(outDuration(pl));
+            return;
+          }
+          i += 1;
+          c = pl[i];
+          playIdxRef.current = i;
+          // Contiguous clips (a plain split) continue without a seek hitch.
+          if (Math.abs(v.currentTime - c.srcStart) > 0.06) v.currentTime = c.srcStart;
+          if (v.paused) v.play().catch(() => {});
+        }
+        if (v.playbackRate !== c.speed) v.playbackRate = c.speed;
+        setCurrentTime(srcToOut(c, v.currentTime));
+      }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -4518,9 +4811,16 @@ export function Editor({
 
   // Scrubbing the timeline should seek the real video.
   const seek = (t: number) => {
-    setCurrentTime(t);
+    const pl = placedRef.current;
+    const o = Math.max(0, Math.min(outDuration(pl), t));
+    setCurrentTime(o);
+    const i = clipIndexAtOut(pl, o);
+    playIdxRef.current = i;
     const v = videoRef.current;
-    if (v && videoSrc) v.currentTime = t;
+    if (v && videoSrc && pl[i]) {
+      v.currentTime = outToSrc(pl[i], o);
+      v.playbackRate = pl[i].speed;
+    }
   };
 
   // Keyboard transport: Space = play/pause, ←/→ = step one frame.
@@ -4555,6 +4855,9 @@ export function Editor({
         seekRef.current(
           Math.min(durationRef.current, currentTimeRef.current + FRAME),
         );
+      } else if (e.key.toLowerCase() === "s" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        splitRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -4572,7 +4875,7 @@ export function Editor({
     if (!v || !videoSrc) return;
     if (t === null) {
       if (!isHoveringRef.current) return;
-      v.currentTime = currentTime;
+      v.currentTime = srcAtOut(currentTimeRef.current);
       if (hoverWasPlayingRef.current) v.play().catch(() => {});
       isHoveringRef.current = false;
       hoverWasPlayingRef.current = false;
@@ -4583,8 +4886,61 @@ export function Editor({
       if (!v.paused) v.pause();
       isHoveringRef.current = true;
     }
+    v.currentTime = srcAtOut(t);
+  };
+
+  // Trim-handle drags preview the exact source frame at the new cut point.
+  const previewSource = (t: number | null) => {
+    const v = videoRef.current;
+    if (!v || !videoSrc) return;
+    if (t === null) {
+      if (!isHoveringRef.current) return;
+      isHoveringRef.current = false;
+      seek(currentTimeRef.current);
+      if (hoverWasPlayingRef.current) v.play().catch(() => {});
+      hoverWasPlayingRef.current = false;
+      return;
+    }
+    if (!isHoveringRef.current) {
+      hoverWasPlayingRef.current = !v.paused;
+      if (!v.paused) v.pause();
+      isHoveringRef.current = true;
+    }
     v.currentTime = t;
   };
+
+  // ---- Clip editing ----------------------------------------------------------
+  const setClips = (clips: Clip[]) => set({ clips });
+  const selectClip = (id: string | null) => {
+    setSelectedClipId(id);
+    if (id) {
+      setSelectedZoomId(null);
+      setSelectedEffectId(null);
+      setSelectedAudioKey(null);
+    }
+  };
+  const splitAtPlayhead = () => {
+    const r = splitAt(effClips, currentTimeRef.current);
+    if (!r) return;
+    setClips(r.clips);
+    selectClip(r.rightId);
+  };
+  const deleteClip = (id: string) => {
+    if (effClips.length <= 1) return;
+    setClips(removeClip(effClips, id));
+    setSelectedClipId(null);
+  };
+  const splitRef = useRef(splitAtPlayhead);
+  splitRef.current = splitAtPlayhead;
+  const deleteClipRef = useRef(deleteClip);
+  deleteClipRef.current = deleteClip;
+  const selectedClipIdx = placed.findIndex((c) => c.id === selectedClipId);
+  const selectedClip = selectedClipIdx >= 0 ? placed[selectedClipIdx] : null;
+
+  // Re-sync the video to the playhead after edits (and keep it in range).
+  useEffect(() => {
+    if (!isHoveringRef.current) seek(currentTimeRef.current);
+  }, [placed]);
 
   // ---- Project save / open -------------------------------------------------
 
@@ -4641,25 +4997,30 @@ export function Editor({
 
     setArtifact(project.artifact);
     histRebaseRef.current = true;
+    const { trimStart = 0, trimEnd = 0, splits: _splits, ...editorState } = project.editorState;
+    pendingLegacyTrimRef.current =
+      !editorState.clips && (trimStart > 0 || trimEnd > 0) ? { trimStart, trimEnd } : null;
     // v1 projects predate audio tracks / camera — backfill defaults. Merge
     // the camera over defaults so saves from before keyframes existed still
     // load with a valid keyframes array.
     setState((s) => ({
       ...s,
-      ...project.editorState,
+      ...editorState,
+      clips: editorState.clips ?? [],
       // Merge over defaults so tracks saved before `normalize` existed load valid.
       audioTracks: {
         system: {
           ...defaultAudioTrack(),
-          ...(project.editorState.audioTracks?.system ?? {}),
+          ...(editorState.audioTracks?.system ?? {}),
         },
-        mic: { ...defaultAudioTrack(), ...(project.editorState.audioTracks?.mic ?? {}) },
+        mic: { ...defaultAudioTrack(), ...(editorState.audioTracks?.mic ?? {}) },
       },
-      camera: project.editorState.camera
-        ? { ...defaultCameraState(), ...project.editorState.camera }
+      camera: editorState.camera
+        ? { ...defaultCameraState(), ...editorState.camera }
         : defaultCameraState(),
     }));
     setSelectedAudioKey(null);
+    setSelectedClipId(null);
     setZoomSettingsRaw((s) => ({ ...s, ...project.zoomSettings }));
     setZoomSegments(project.zoomSegments ?? []);
     setSelectedZoomId(null);
@@ -4695,6 +5056,7 @@ export function Editor({
     if (key) {
       setActiveRail("audio");
       setSelectedZoomId(null);
+      setSelectedClipId(null);
     }
   };
 
@@ -4703,8 +5065,8 @@ export function Editor({
   // bubble animates; dragging it then writes/updates a keyframe at the
   // playhead instead of moving the static base position.
   const cameraEff = useMemo(
-    () => cameraAt(state.camera, currentTime),
-    [state.camera, currentTime],
+    () => cameraAt(state.camera, srcTime),
+    [state.camera, srcTime],
   );
 
   const KF_EPS = 0.05; // keyframes closer than this (s) are replaced, not added
@@ -4723,7 +5085,7 @@ export function Editor({
             },
           };
         }
-        const t = currentTimeRef.current;
+        const t = srcTimeRef.current;
         const eff = cameraAt(cam, t);
         const kf: CameraKeyframe = { t, pos: p.pos ?? eff.pos, size: p.size ?? eff.size };
         const keyframes = [
@@ -4737,7 +5099,7 @@ export function Editor({
   );
 
   const addCameraKeyframe = () => {
-    const t = currentTimeRef.current;
+    const t = srcTimeRef.current;
     setState((s) => {
       const eff = cameraAt(s.camera, t);
       const keyframes = [
@@ -4764,6 +5126,7 @@ export function Editor({
     setActiveRail("webcam");
     setSelectedZoomId(null);
     setSelectedAudioKey(null);
+    setSelectedClipId(null);
   };
 
   // Route the native File-menu items to the handlers. Refs keep the
@@ -4866,6 +5229,7 @@ export function Editor({
           cameraVideoRef={cameraVideoRef}
           onCameraTransform={handleCameraTransform}
           onCameraSelect={selectCamera}
+          onSplit={splitAtPlayhead}
         />
         <IconRail active={activeRail} setActive={setActiveRail} />
         <Inspector
@@ -4882,11 +5246,30 @@ export function Editor({
           audioRows={audioRows}
           onAudioTrack={setAudioTrack}
           selectedAudioKey={selectedAudioKey}
-          duration={duration}
+          duration={srcDuration}
           hasCamera={cameraSrc !== null}
           onCameraAddKeyframe={addCameraKeyframe}
           onCameraClearKeyframes={clearCameraKeyframes}
-          currentTime={currentTime}
+          currentTime={srcTime}
+          clipPanel={
+            selectedClip
+              ? {
+                  clip: selectedClip,
+                  index: selectedClipIdx,
+                  count: placed.length,
+                  onPatch: (patch) => setClips(patchClip(effClips, selectedClip.id, patch)),
+                  onSplit: splitAtPlayhead,
+                  onDelete: () => deleteClip(selectedClip.id),
+                  onDuplicate: () => {
+                    const r = duplicateClip(effClips, selectedClip.id);
+                    setClips(r.clips);
+                    selectClip(r.newId);
+                  },
+                  onMove: (dir) =>
+                    setClips(moveClip(effClips, selectedClip.id, selectedClipIdx + dir)),
+                }
+              : null
+          }
           effectSegments={effectSegments}
           setEffectSegments={setEffectSegments}
           selectedEffectSeg={selectedEffectSeg}
@@ -4907,11 +5290,13 @@ export function Editor({
         duration={duration}
         currentTime={currentTime}
         setCurrentTime={seek}
-        trimStart={state.trimStart}
-        trimEnd={state.trimEnd}
-        onTrimStart={() => set({ trimStart: Math.min(currentTime, duration - state.trimEnd) })}
-        onTrimEnd={() => set({ trimEnd: Math.min(duration - currentTime, duration - state.trimStart) })}
-        splits={state.splits}
+        clips={placed}
+        srcDuration={srcDuration}
+        selectedClipId={selectedClipId}
+        onSelectClip={selectClip}
+        onClipPatch={(id, patch) => setClips(patchClip(effClips, id, patch))}
+        onMoveClip={(id, to) => setClips(moveClip(effClips, id, to))}
+        onPreviewSource={previewSource}
         zoom={state.zoom}
         setZoom={(v) => set({ zoom: v })}
         playing={playing}
@@ -4946,7 +5331,7 @@ export function Editor({
       {cropOpen && (
         <CropDialog
           videoSrc={videoSrc}
-          previewTime={currentTime}
+          previewTime={srcTime}
           videoNaturalSize={videoNaturalSize}
           initialCrop={state.cropRect}
           onClose={() => setCropOpen(false)}
@@ -4980,8 +5365,7 @@ export function Editor({
               Math.min(1, zoomSettings.smoothing / 100),
             )}
             effectSegments={effectSegments}
-            trimStart={state.trimStart}
-            trimEnd={state.trimEnd}
+            clips={placed}
             audioTracks={[
               ...(artifact.systemAudioPath
                 ? [

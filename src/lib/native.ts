@@ -178,6 +178,7 @@ export type AudioTrackSpec = {
   srcEnd: number;
   delay: number;
   gain: number;
+  tempo?: number;
 };
 
 export const native = {
