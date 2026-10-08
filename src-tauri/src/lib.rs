@@ -64,7 +64,10 @@ mod editor;
 mod export;
 mod permissions;
 mod picker;
+mod preview_audio;
 mod project;
+mod transcribe;
+mod video_frames;
 
 pub use permissions::probe_screen_recording_and_exit;
 
@@ -73,6 +76,9 @@ use editor::*;
 use export::*;
 use permissions::*;
 use picker::*;
+use preview_audio::*;
+use transcribe::*;
+use video_frames::*;
 use project::*;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -100,6 +106,7 @@ pub fn run() {
         .manage(MeterState::default())
         .manage(PickerTrackerState::default())
         .manage(PendingProjectFile::default())
+        .manage(PreviewAudio::default())
         .setup(|app| {
             // In debug builds (or when OSS_SKIP_PERMS=1) skip the onboarding
             // window — `tauri dev` runs as the dev shell and re-prompts every
@@ -332,10 +339,19 @@ pub fn run() {
             export_frame,
             export_finish,
             export_cancel,
+            export_video_frame,
             copy_file_to_clipboard,
             pick_export_path,
             quit_app,
+            preview_audio_load,
+            preview_audio_set,
+            preview_audio_gains,
+            preview_audio_pos,
             take_pending_project_file,
+            openai_key_status,
+            openai_key_set,
+            openai_key_clear,
+            transcribe_audio,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

@@ -34,6 +34,7 @@ struct PendingBuf {
     channels: u16,
     sample_rate: u32,
     samples: Vec<f32>, // interleaved
+    fmt: SampleFmt,
 }
 
 struct TapState {
@@ -49,10 +50,35 @@ pub struct AudioTap {
     anchor: VideoAnchor,
 }
 
-fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+#[derive(Clone, Copy, Debug)]
+struct SampleFmt {
+    float: bool,
+    big_endian: bool,
+    bits: u32,
+}
+
+/// Decode PCM bytes to f32 in [-1, 1] per the stream's real format; external
+/// mics often deliver integer PCM rather than SCK's usual f32.
+fn bytes_to_f32(bytes: &[u8], f: SampleFmt) -> Vec<f32> {
+    let width = ((f.bits + 7) / 8).max(1) as usize;
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .chunks_exact(width)
+        .map(|c| {
+            let mut b = [0u8; 8];
+            b[..width].copy_from_slice(c);
+            if f.big_endian {
+                b[..width].reverse();
+            }
+            let v = match (f.float, width) {
+                (true, 4) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                (true, 8) => f64::from_le_bytes(b) as f32,
+                (false, 2) => i16::from_le_bytes([b[0], b[1]]) as f32 / 32_768.0,
+                (false, 3) => (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0,
+                (false, 4) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0,
+                _ => 0.0,
+            };
+            if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 }
+        })
         .collect()
 }
 
@@ -65,6 +91,11 @@ fn extract(sample: &CMSampleBuffer) -> Option<PendingBuf> {
         return None;
     }
     let sample_rate = fmt.audio_sample_rate().unwrap_or(48_000.0).round() as u32;
+    let sfmt = SampleFmt {
+        float: fmt.audio_is_float(),
+        big_endian: fmt.audio_is_big_endian(),
+        bits: fmt.audio_bits_per_channel().filter(|b| *b > 0).unwrap_or(32),
+    };
     let pts = {
         let t = sample.presentation_timestamp();
         if t.timescale == 0 {
@@ -79,10 +110,10 @@ fn extract(sample: &CMSampleBuffer) -> Option<PendingBuf> {
     }
     let (channels, samples) = if n == 1 {
         let buf = list.get(0)?;
-        ((buf.number_channels.max(1) as u16), bytes_to_f32(buf.data()))
+        ((buf.number_channels.max(1) as u16), bytes_to_f32(buf.data(), sfmt))
     } else {
         let chans: Vec<Vec<f32>> = (0..n)
-            .filter_map(|i| list.get(i).map(|b| bytes_to_f32(b.data())))
+            .filter_map(|i| list.get(i).map(|b| bytes_to_f32(b.data(), sfmt)))
             .collect();
         if chans.len() != n {
             return None;
@@ -96,7 +127,7 @@ fn extract(sample: &CMSampleBuffer) -> Option<PendingBuf> {
         }
         (n as u16, out)
     };
-    Some(PendingBuf { pts, channels, sample_rate, samples })
+    Some(PendingBuf { pts, channels, sample_rate, samples, fmt: sfmt })
 }
 
 fn write_interleaved(writer: &mut WavWriter, samples: &[f32]) {
@@ -108,6 +139,11 @@ fn write_interleaved(writer: &mut WavWriter, samples: &[f32]) {
 /// Write `buf` as the first audio of the file: create the writer, then align
 /// the stream to `anchor` by dropping early samples or prepending silence.
 fn write_first(state: &mut TapState, path: &Path, anchor: f64, buf: PendingBuf) {
+    eprintln!(
+        "[audio] {} format: {:?}, {} ch, {} Hz",
+        path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+        buf.fmt, buf.channels, buf.sample_rate
+    );
     let spec = hound::WavSpec {
         channels: buf.channels,
         sample_rate: buf.sample_rate,

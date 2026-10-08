@@ -88,6 +88,10 @@ src/
     native.ts                   typed Tauri command wrappers + listen helpers + sidecar types
     autoZoom.ts                 derive zoom segments from cursor-sidecar clicks
     effects.ts                  plugin registry + timeline effect segments (color grade/vignette/grain/glow)
+    clips.ts                    clip sequence (output ↔ source time, split/trim/speed)
+    cameraCuts.ts               camera-track cuts with per-cut time shift / hidden gaps
+    audioPieces.ts              audio-track split pieces with per-piece silence
+    captions.ts                 auto-subtitle model + Canvas2D caption renderer
   styles/
     globals.css                 design system (~2100 lines, ported from the handoff)
     tokens.css                  CSS custom properties / design tokens
@@ -104,7 +108,10 @@ src-tauri/
   src/project.rs                .openscreen save/open + Finder double-click handoff
   src/export.rs                 export sessions: frame streaming + ffmpeg encode/mux
   src/camera.rs                 AVFoundation camera: enumeration, TCC auth, sidecar recorder
-  src/audio_tap.rs              SCK PCM taps → sidecar WAVs, segment concat
+  src/audio_tap.rs              SCK PCM taps → sidecar WAVs (format-aware: f32/i16/i24/i32, BE/LE)
+  src/preview_audio.rs          native editor audio playback (cpal, mmap'd sidecar WAVs)
+  src/video_frames.rs           ffmpeg-decoded RGBA frames for export (per-session decoders)
+  src/transcribe.rs             OpenAI key storage + whisper-1 transcription for captions
   src/main.rs                   thin entry; also handles --probe-screen-recording subprocess
   build.rs                      tauri-build
   binaries/                     bundled ffmpeg-{aarch64,x86_64}-apple-darwin (gitignored, fetched)
@@ -129,14 +136,21 @@ scripts/fetch-ffmpeg.sh         downloads the platform ffmpeg binaries (run on p
   - mic: `start_mic_meter`, `stop_mic_meter`
   - picker: `list_displays`, `list_windows`, `open_picker_overlays`, `close_picker_overlays`, `picker_select_display`, `picker_select_window`, `picker_select_area`
   - editor/project: `open_editor_with_artifact`, `open_dev_editor`, `confirm_and_discard_editor`, `present_editor`, `save_project`, `open_project`
-  - export: `export_begin`, `export_frame`, `export_finish`, `export_cancel`, `pick_export_path`, `copy_file_to_clipboard`
+  - export: `export_begin`, `export_frame`, `export_finish`, `export_cancel`, `pick_export_path`, `copy_file_to_clipboard`, `export_video_frame`
+  - preview audio: `preview_audio_load`, `preview_audio_set`, `preview_audio_gains`, `preview_audio_pos`
+  - captions: `openai_key_status`, `openai_key_set`, `openai_key_clear`, `transcribe_audio`
   - wallpaper: `list_macos_wallpapers`, `current_macos_wallpaper`
   - app: `quit_app` (exit unless the editor window is visible)
 
   The SCK stream + recording output live in `RecordingState`; the `cpal` mic stream owns its own thread because `cpal::Stream` is `!Send` on macOS; `CursorTrack` runs a polling thread and serializes the sidecar on stop.
 - **Frontend ↔ Rust bridge** — [`src/lib/native.ts`](src/lib/native.ts). The `native` object wraps every command; listen helpers: `onMicLevel`, `onRecordingArtifact`, `onRecordingStoppedExternally`, `onPickerSelected`, `onPickerState`, `onPickerHover`, `onMenuSaveProject`, `onMenuOpenProject`. Cursor-sidecar TypeScript types (`CursorSidecar`, `CursorSidecarShapeName`, …) live here too. Add new commands here, keep return types narrow.
 - **Editor** — [`src/components/Editor/index.tsx`](src/components/Editor/index.tsx). The largest component. Owns video playback, timeline scrubbing, auto-zoom segments (via `lib/autoZoom.ts` + the cursor sidecar), the cursor overlay, preview-quality settings, and project save/open.
-- **Clip sequence (cutting / speed)** — [`src/lib/clips.ts`](src/lib/clips.ts). `EditorState.clips` is the edited output: an ordered list of source ranges, each with its own `speed` (0.25–16×) and `muted` flag (empty = whole recording). The timeline axis and the editor's `currentTime` are **output** time; zoom/effect segments, camera keyframes, audio-track trims and the cursor sidecar stay in **source** time and are mapped per clip for display (`srcRangePieces`, `outToSrc`, `srcToOut`). Preview walks the clips in a rAF loop (seek + `playbackRate` per clip); export renders output frames and emits one audio spec per clip × track with an ffmpeg `atempo` for the speed. Pre-v4 projects' `trimStart`/`trimEnd` are converted to a single clip on load.
+- **Clip sequence (cutting / speed)** — [`src/lib/clips.ts`](src/lib/clips.ts). `EditorState.clips` is the edited output: an ordered list of source ranges, each with its own `speed` (0.25–50×, presets up to 50×, custom input) and `muted` flag (empty = whole recording). The timeline axis and the editor's `currentTime` are **output** time; zoom/effect segments, camera keyframes, audio-track trims and the cursor sidecar stay in **source** time and are mapped per clip for display (`srcRangePieces`, `outToSrc`, `srcToOut`). Preview walks the clips in a rAF loop (seek + `playbackRate` per clip); export renders output frames and emits one audio spec per clip × track with an ffmpeg `atempo` for the speed. Pre-v4 projects' `trimStart`/`trimEnd` are converted to a single clip on load. Above `NATIVE_RATE_MAX` (16×, WebKit's `playbackRate` cap) the preview seek-steps instead of playing. Splitting is CapCut-style: `S` with nothing selected cuts clips, camera cuts and audio pieces at the playhead (`splitAt`); with a block selected only that block is cut.
+- **Camera cuts** — [`src/lib/cameraCuts.ts`](src/lib/cameraCuts.ts). The camera row can be split independently; each `CameraCut` has a `shift` (s) applied to the camera source time, so a desynced camera can be slid back into sync (drag or ⌥←/→). Gaps between cuts hide the camera in preview and export.
+- **Audio pieces** — [`src/lib/audioPieces.ts`](src/lib/audioPieces.ts). Mic/system tracks can be split into `AudioPiece`s; ⌫ toggles `muted` on the selected piece. Export builds its audio specs from `audibleRanges`, the preview zeroes gains via `isSilencedAt`.
+- **Preview audio is native** — WKWebView's Web Audio output is silent in the bundled app, so the editor drives [`preview_audio.rs`](src-tauri/src/preview_audio.rs) (cpal/CoreAudio) with `preview_audio_set(playing, t, rate)` and per-track gains. Times sent to it are **source** time; compare them against the source duration, not the output duration.
+- **Export frames are decoded natively** — WebKit purges paused `<video>` decoders under memory pressure (frozen frames, crashes on multi-GB files), so the exporter pulls RGBA frames from [`video_frames.rs`](src-tauri/src/video_frames.rs) (`export_video_frame`, a forward-streaming ffmpeg with VideoToolbox, BT.709). Decoders are closed in `cleanup_session`. Before creating a blob URL for preview, `useSameOriginSrc` probes the file size (`Range: bytes=0-0`) and streams large files instead of fetching them whole.
+- **Auto-subtitles** — [`src/lib/captions.ts`](src/lib/captions.ts) + [`transcribe.rs`](src-tauri/src/transcribe.rs). The OpenAI key is stored in a 0600 file and never returned to the webview; audio is chunked and sent to whisper-1. Captions are drawn by one Canvas2D renderer for both the preview overlay and export (`GLCompositor.drawOverlay`).
 - **Auto-zoom** — [`src/lib/autoZoom.ts`](src/lib/autoZoom.ts). Pure logic: derives `ZoomSegment`s from sidecar clicks; the editor renders/edits them.
 - **Plugin-based timeline video effects** — [`src/lib/effects.ts`](src/lib/effects.ts) is the plugin registry: each `EffectPluginDef` (Black & White, Sepia, Vintage Film, Vignette, Warm Glow, Cool Tone, Dreamy Soft, High Contrast, Film Grain, Invert Flash, …) declares only the `PostFxParams` keys it changes at full strength (brightness/contrast/saturation/temperature/hueRotate/sepia/invert/vignette/grain/blur — the param set lives in `lib/compositor.ts`); adding a look is one registry entry, no renderer changes. `EffectSegment`s place a plugin + 0–1 intensity over a time range on the timeline's Effects track (mirrors `ZoomSegment`, own crossfade at segment edges). `resolveEffectParams(tMs, segments)` blends the active segment toward neutral; `renderFrame` (Canvas2D) and `GLCompositor.render()` (WebGL, via an offscreen FBO + fullscreen grading shader) both apply the *same* resolved params as the last compositing step, so preview and export match. The DOM (non-GL) preview fallback applies only the CSS-filter-representable subset (`postFxCssFilter`) directly to the recorded-window element.
 - **Design system** — [`src/styles/globals.css`](src/styles/globals.css) and [`tokens.css`](src/styles/tokens.css) are the single source of truth for colors, spacing, and component classes. **Do not** restyle components inline; reuse existing class names.

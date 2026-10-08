@@ -358,6 +358,7 @@ export class GLCompositor {
   private postTexH = 0;
   private videoTex: WebGLTexture;
   private cameraTex: WebGLTexture;
+  private overlayTex: WebGLTexture | null = null;
   private wallpaperTex: WebGLTexture | null = null;
   private wallpaperKey = "";
   private glyphTex = new Map<CursorSidecarShapeName, WebGLTexture>();
@@ -722,6 +723,20 @@ export class GLCompositor {
     }
   }
 
+  /** Composite a full-frame transparent canvas (captions) over the last render(). */
+  drawOverlay(src: TexImageSource) {
+    const gl = this.gl;
+    const w = gl.drawingBufferWidth;
+    const h = gl.drawingBufferHeight;
+    gl.useProgram(this.program);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, w, h);
+    gl.uniform2f(this.uniforms.uViewport, w, h);
+    this.overlayTex ??= this.makeTexture();
+    this.upload(this.overlayTex, src, true);
+    this.draw({ xf: sc(w, h), tex: this.overlayTex });
+  }
+
   /** Lazily (re)create the offscreen color target the scene bakes into. */
   private ensurePostTarget(w: number, h: number) {
     const gl = this.gl;
@@ -802,6 +817,7 @@ export class GLCompositor {
     const gl = this.gl;
     gl.deleteTexture(this.videoTex);
     gl.deleteTexture(this.cameraTex);
+    if (this.overlayTex) gl.deleteTexture(this.overlayTex);
     if (this.wallpaperTex) gl.deleteTexture(this.wallpaperTex);
     if (this.postTex) gl.deleteTexture(this.postTex);
     if (this.postFbo) gl.deleteFramebuffer(this.postFbo);

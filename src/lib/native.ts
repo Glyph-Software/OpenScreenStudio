@@ -181,7 +181,20 @@ export type AudioTrackSpec = {
   tempo?: number;
 };
 
+export type TimedText = { text: string; start: number; end: number };
+export type Transcript = { language: string; words: TimedText[]; segments: TimedText[] };
+
 export const native = {
+  openaiKeyStatus: () => invoke<string | null>("openai_key_status"),
+  openaiKeySet: (key: string) => invoke<string>("openai_key_set", { key }),
+  openaiKeyClear: () => invoke<void>("openai_key_clear"),
+  transcribeAudio: (paths: string[], language: string | null) =>
+    invoke<Transcript>("transcribe_audio", { args: { paths, language } }),
+  onTranscribeProgress: (
+    cb: (p: { done: number; total: number }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ done: number; total: number }>("transcribe-progress", (e) => cb(e.payload)),
+
   listMacWallpapers: () => invoke<MacWallpaper[]>("list_macos_wallpapers"),
   currentMacWallpaper: () => invoke<string | null>("current_macos_wallpaper"),
   listCaptureSources: () => invoke<CaptureSource[]>("list_capture_sources"),
@@ -249,6 +262,9 @@ export const native = {
         },
       },
     ),
+  /** Raw RGBA (width*height*4) of the frame shown at `t` seconds, decoded natively. */
+  exportVideoFrame: (sessionId: string, path: string, t: number, width: number, height: number) =>
+    invoke<ArrayBuffer>("export_video_frame", { sessionId, path, t, width, height }),
   exportFinish: (
     sessionId: string,
     outPath: string,
@@ -301,6 +317,11 @@ export const native = {
   requestAccessibility: () => invoke<boolean>("request_accessibility"),
   dismissPermissions: () => invoke<void>("dismiss_permissions"),
   quitApp: () => invoke<void>("quit_app"),
+  previewAudioLoad: (paths: string[]) => invoke<void>("preview_audio_load", { paths }),
+  previewAudioSet: (playing: boolean, t: number, rate: number) =>
+    invoke<void>("preview_audio_set", { playing, t, rate }).catch(() => {}),
+  previewAudioGains: (gains: number[]) => invoke<void>("preview_audio_gains", { gains }).catch(() => {}),
+  previewAudioPos: () => invoke<number>("preview_audio_pos"),
 
   listDisplays: () => invoke<DisplayInfo[]>("list_displays"),
   listWindows: () => invoke<WindowInfo[]>("list_windows"),

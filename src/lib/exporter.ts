@@ -14,8 +14,10 @@ import {
 } from "./native";
 import type { ZoomSegment } from "./autoZoom";
 import type { EffectSegment } from "./effects";
+import { audibleRanges, type AudioPiece } from "./audioPieces";
 import { clipIndexAtOut, outDuration, outToSrc, type PlacedClip } from "./clips";
 import { resolveEffectParams } from "./effects";
+import { drawCaptions, hasCaptions, type CaptionsState } from "./captions";
 import {
   cameraAt,
   computeFrameLayout,
@@ -27,6 +29,7 @@ import {
   type RenderFrameOpts,
 } from "./compositor";
 import { GLCompositor, rasterizeGlyphsGL } from "./compositorGL";
+import { cameraCutAt, type CameraCut } from "./cameraCuts";
 
 export type ExportResolution = "720" | "1080" | "4k";
 export type ExportTarget = "file" | "clipboard";
@@ -42,6 +45,7 @@ export type ExportAudioTrack = {
   gain: number;
   trimStart: number;
   trimEnd: number;
+  pieces?: AudioPiece[];
 };
 
 /** The camera sidecar movie plus its bubble placement, for compositing. */
@@ -56,6 +60,8 @@ export type ExportCameraTrack = {
   mirrored: boolean;
   /** Position/size keyframes (timeline seconds); empty = static placement. */
   keyframes: CameraKeyframe[];
+  /** Visible camera windows with their content shift (source seconds). */
+  cuts: CameraCut[];
 };
 
 const RES_HEIGHT: Record<ExportResolution, number> = {
@@ -117,33 +123,21 @@ export function formatBytes(b: number): string {
   return `${Math.round(b)}B`;
 }
 
-function seekVideo(v: HTMLVideoElement, t: number): Promise<void> {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      resolve();
-    };
-    const anyV = v as HTMLVideoElement & {
-      requestVideoFrameCallback?: (cb: () => void) => number;
-    };
-    const onSeeked = () => {
-      if (typeof anyV.requestVideoFrameCallback === "function") {
-        anyV.requestVideoFrameCallback(() => finish());
-        // Safety: rVFC won't fire while paused on some platforms.
-        setTimeout(finish, 60);
-      } else {
-        finish();
-      }
-    };
-    v.addEventListener("seeked", onSeeked, { once: true });
-    try {
-      v.currentTime = t;
-    } catch {
-      finish();
-    }
-  });
+/** Scale natural dims down (never up) to at most maxH pixels tall. */
+function fitHeight(n: { w: number; h: number }, maxH: number): { w: number; h: number } {
+  const k = Math.min(1, maxH / n.h);
+  return { w: Math.max(2, Math.round(n.w * k)), h: Math.max(2, Math.round(n.h * k)) };
+}
+
+// Native (ffmpeg) decode: WebKit purges paused <video> decoders under memory pressure / when hidden, freezing seeks.
+async function decodedFrame(
+  sessionId: string,
+  path: string,
+  t: number,
+  size: { w: number; h: number },
+): Promise<ImageBitmap> {
+  const buf = await native.exportVideoFrame(sessionId, path, t, size.w, size.h);
+  return createImageBitmap(new ImageData(new Uint8ClampedArray(buf), size.w, size.h));
 }
 
 function canvasToPng(c: HTMLCanvasElement): Promise<Uint8Array> {
@@ -175,6 +169,8 @@ export type ExportParams = {
   smoothing: number;
   /** Plugin-based timeline video effects (see lib/effects.ts). */
   effectSegments: EffectSegment[];
+  /** Auto-subtitles, drawn on top of everything (after effects). */
+  captions: CaptionsState | null;
   /** The edited sequence (output order, per-clip speed/mute). */
   clips: PlacedClip[];
   /**
@@ -228,7 +224,6 @@ export async function exportVideo(
   let unlistenProgress: (() => void) | null = null;
   let glc: GLCompositor | null = null;
   const objectUrls: string[] = [];
-  const video = document.createElement("video");
   const cameraVideo = document.createElement("video");
   try {
     const layout = computeFrameLayout({
@@ -242,34 +237,13 @@ export async function exportVideo(
     const dims = resolveOutputDims(layout.ratio, p.resolution);
     const s = dims.h / layout.h;
 
-    const videoUrl = await fileObjectUrl(p.artifact.path);
-    objectUrls.push(videoUrl);
-    video.muted = true;
-    video.preload = "auto";
-    (video as HTMLVideoElement).playsInline = true;
-    video.src = videoUrl;
-    await new Promise<void>((resolve, reject) => {
-      video.addEventListener("loadedmetadata", () => resolve(), {
-        once: true,
-      });
-      video.addEventListener(
-        "error",
-        () => reject(new Error("Failed to load recording for export")),
-        { once: true },
-      );
-    });
-
-    // Camera sidecar: a second offscreen video, seeked in lockstep with the
-    // main one (shifted by the recorded start offset).
+    // Camera sidecar: the element only reads metadata (size, duration); frames are decoded natively.
     const cam = p.camera && p.camera.enabled ? p.camera : null;
     let cameraDur = 0;
+    let camNatural = { w: 1280, h: 720 };
     if (cam) {
-      const camUrl = await fileObjectUrl(cam.path);
-      objectUrls.push(camUrl);
-      cameraVideo.muted = true;
-      cameraVideo.preload = "auto";
-      cameraVideo.playsInline = true;
-      cameraVideo.src = camUrl;
+      cameraVideo.preload = "metadata";
+      cameraVideo.src = convertFileSrc(cam.path);
       await new Promise<void>((resolve, reject) => {
         cameraVideo.addEventListener("loadedmetadata", () => resolve(), { once: true });
         cameraVideo.addEventListener(
@@ -279,6 +253,9 @@ export async function exportVideo(
         );
       });
       cameraDur = isFinite(cameraVideo.duration) ? cameraVideo.duration : 0;
+      if (cameraVideo.videoWidth && cameraVideo.videoHeight) {
+        camNatural = { w: cameraVideo.videoWidth, h: cameraVideo.videoHeight };
+      }
     }
 
     let wallpaperUrl: string | null = null;
@@ -332,10 +309,19 @@ export async function exportVideo(
       raw,
     );
 
+    const captions = hasCaptions(p.captions) ? p.captions : null;
+    const capCanvas = document.createElement("canvas");
+    capCanvas.width = dims.w;
+    capCanvas.height = dims.h;
+    const capCtx = captions ? capCanvas.getContext("2d") : null;
+
     const cursorState = makeCursorRenderState();
     const dtSec = 1 / p.fps;
     let rawBuf: Uint8Array | undefined;
 
+    // GL samples normalized coords, so 2x output height suffices (sharp zooms); Canvas2D crops in natural pixels.
+    const screenSize = () => (glc ? fitHeight(p.videoNaturalSize, dims.h * 2) : p.videoNaturalSize);
+    const camSize = fitHeight(camNatural, dims.h);
     for (let i = 0; i < totalFrames; i++) {
       if (p.signal.aborted) {
         await native.exportCancel(sessionId);
@@ -344,20 +330,22 @@ export async function exportVideo(
       const o = i / p.fps;
       const clip = p.clips[clipIndexAtOut(p.clips, o)];
       const t = Math.min(clip.srcEnd - 1e-3, outToSrc(clip, o));
-      await seekVideo(video, t);
-      if (cam) {
-        const camT = Math.max(
-          0,
-          Math.min(Math.max(0, cameraDur - 1e-3), t - cam.offsetMs / 1000),
-        );
-        await seekVideo(cameraVideo, camT);
-      }
+      const camCut = cam ? cameraCutAt(cam.cuts, t) : null;
+      const camT = cam && camCut
+        ? Math.max(0, Math.min(Math.max(0, cameraDur - 1e-3), t - cam.offsetMs / 1000 - camCut.shift))
+        : 0;
+      const frames = await Promise.all([
+        decodedFrame(sessionId, p.artifact.path, t, screenSize()),
+        cam && camCut ? decodedFrame(sessionId, cam.path, camT, camSize) : null,
+      ]);
+      let screenFrame = frames[0];
+      const camFrame = frames[1];
       const frameOpts: RenderFrameOpts = {
         layout,
         s,
         outW: dims.w,
         outH: dims.h,
-        videoSource: video,
+        videoSource: screenFrame,
         videoNaturalSize: p.videoNaturalSize,
         wallpaper: p.wallpaper,
         wallpaperImg,
@@ -372,17 +360,14 @@ export async function exportVideo(
         cursorState,
         dtSec,
         postFx: resolveEffectParams(t * 1000, p.effectSegments),
-        camera: cam
+        camera: cam && camCut
           ? (() => {
               // Keyframed bubble motion, evaluated at the absolute timeline
               // time — identical to the editor preview.
               const eff = cameraAt(cam, t);
               return {
-                source: cameraVideo,
-                naturalSize: {
-                  w: cameraVideo.videoWidth || 1280,
-                  h: cameraVideo.videoHeight || 720,
-                },
+                source: camFrame!,
+                naturalSize: camNatural,
                 pos: eff.pos,
                 size: eff.size,
                 shape: cam.shape,
@@ -414,10 +399,19 @@ export async function exportVideo(
               false,
             );
           }
+          screenFrame.close();
+          screenFrame = await decodedFrame(sessionId, p.artifact.path, t, screenSize());
+          frameOpts.videoSource = screenFrame;
         }
+      }
+      let capDrawn = false;
+      if (capCtx && captions) {
+        capCtx.clearRect(0, 0, dims.w, dims.h);
+        capDrawn = !!drawCaptions(capCtx, { outW: dims.w, outH: dims.h, tMs: t * 1000, captions });
       }
       let bytes: Uint8Array;
       if (glc) {
+        if (capDrawn) glc.drawOverlay(capCanvas);
         if (raw) {
           rawBuf = glc.readPixels(rawBuf);
           bytes = rawBuf;
@@ -426,8 +420,11 @@ export async function exportVideo(
         }
       } else {
         renderFrame(ensure2d(), frameOpts);
+        if (capDrawn) ensure2d().drawImage(capCanvas, 0, 0);
         bytes = await canvasToPng(canvas2d!);
       }
+      screenFrame.close();
+      camFrame?.close();
       await native.exportFrame(sessionId, i, bytes);
       p.onProgress((i + 1) / totalFrames * 0.9, "Rendering frames");
     }
@@ -477,20 +474,22 @@ export async function exportVideo(
         .flatMap((t) =>
           p.clips
             .filter((c) => !c.muted)
-            .map((c): AudioTrackSpec | null => {
-              const s0 = Math.max(c.srcStart, t.trimStart);
-              const s1 = Math.min(c.srcEnd, p.videoDurationSec - t.trimEnd);
-              if (s1 - s0 < 0.01) return null;
-              return {
-                path: t.path,
-                srcStart: s0,
-                srcEnd: s1,
-                delay: c.outStart + (s0 - c.srcStart) / c.speed,
-                gain: t.gain,
-                tempo: c.speed,
-              };
-            })
-            .filter((s): s is AudioTrackSpec => s !== null),
+            .flatMap((c) =>
+              audibleRanges(
+                t.pieces,
+                Math.max(c.srcStart, t.trimStart),
+                Math.min(c.srcEnd, p.videoDurationSec - t.trimEnd),
+              )
+                .filter(([s0, s1]) => s1 - s0 >= 0.01)
+                .map(([s0, s1]): AudioTrackSpec => ({
+                  path: t.path,
+                  srcStart: s0,
+                  srcEnd: s1,
+                  delay: c.outStart + (s0 - c.srcStart) / c.speed,
+                  gain: t.gain,
+                  tempo: c.speed,
+                })),
+            ),
         );
     }
 
@@ -513,8 +512,6 @@ export async function exportVideo(
   } finally {
     if (unlistenProgress) unlistenProgress();
     glc?.dispose({ loseContext: true });
-    video.removeAttribute("src");
-    video.load();
     cameraVideo.removeAttribute("src");
     cameraVideo.load();
     for (const u of objectUrls) URL.revokeObjectURL(u);

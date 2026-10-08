@@ -3,6 +3,7 @@ import { Ico } from "../icons";
 import type { CaptureArtifact, CursorSidecar } from "../../lib/native";
 import type { ZoomSegment } from "../../lib/autoZoom";
 import type { EffectSegment } from "../../lib/effects";
+import type { CaptionsState } from "../../lib/captions";
 import { outDuration, type PlacedClip } from "../../lib/clips";
 import { computeFrameLayout, type CropRect } from "../../lib/compositor";
 import {
@@ -91,6 +92,7 @@ export function ExportDialog(props: {
   zoomEnabled: boolean;
   smoothing: number;
   effectSegments: EffectSegment[];
+  captions: CaptionsState | null;
   clips: PlacedClip[];
   audioTracks: ExportAudioTrack[];
   camera: ExportCameraTrack | null;
@@ -197,6 +199,7 @@ export function ExportDialog(props: {
       zoomEnabled: props.zoomEnabled,
       smoothing: props.smoothing,
       effectSegments: props.effectSegments,
+      captions: props.captions,
       clips: props.clips,
       audioTracks: props.audioTracks,
       camera: props.camera,

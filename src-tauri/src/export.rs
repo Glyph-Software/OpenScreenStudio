@@ -567,6 +567,7 @@ pub(crate) fn export_finish(
     // only drop the PNG frames. Otherwise remove the whole session dir.
     if out_path.is_empty() {
         let _ = remove_export_pngs(&dir);
+        close_frame_decoders(&session_id);
         EXPORT_SESSIONS.lock().remove(&session_id);
     } else {
         cleanup_session(&session_id);
@@ -586,6 +587,7 @@ pub(crate) fn remove_export_pngs(dir: &Path) {
 }
 
 pub(crate) fn cleanup_session(session_id: &str) {
+    close_frame_decoders(session_id);
     if let Some(s) = EXPORT_SESSIONS.lock().remove(session_id) {
         let _ = fs::remove_dir_all(&s.dir);
     }

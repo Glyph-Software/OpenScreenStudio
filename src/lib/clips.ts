@@ -17,8 +17,10 @@ export type PlacedClip = Clip & { outStart: number; outEnd: number };
 
 export const MIN_CLIP_SEC = 0.1;
 export const SPEED_MIN = 0.25;
-export const SPEED_MAX = 16;
-export const SPEED_PRESETS = [0.5, 1, 1.5, 2, 4, 8, 10, 16];
+export const SPEED_MAX = 50;
+export const SPEED_PRESETS = [0.5, 1, 2, 4, 8, 16, 25, 50];
+/** Highest rate the <video> element plays natively; faster clips are stepped by seeking. */
+export const NATIVE_RATE_MAX = 16;
 
 export const newClipId = () =>
   `clip-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -78,16 +80,34 @@ export function srcRangePieces(
 }
 
 /** Split the clip under output time `o`. Returns null when too close to an edge. */
-export function splitAt(clips: Clip[], o: number): { clips: Clip[]; rightId: string } | null {
+export function splitAt(
+  clips: Clip[],
+  o: number,
+  onlyId?: string,
+): { clips: Clip[]; rightId: string } | null {
   const placed = layoutClips(clips);
   const i = clipIndexAtOut(placed, o);
   const c = placed[i];
-  if (!c) return null;
+  if (!c || (onlyId && c.id !== onlyId)) return null;
   const t = outToSrc(c, o);
   if (t - c.srcStart < MIN_CLIP_SEC || c.srcEnd - t < MIN_CLIP_SEC) return null;
   const left: Clip = { ...clips[i], id: newClipId(), srcEnd: t };
   const right: Clip = { ...clips[i], id: newClipId(), srcStart: t };
   return { clips: [...clips.slice(0, i), left, right, ...clips.slice(i + 1)], rightId: right.id };
+}
+
+/** Split every timed segment (or only `onlyId`) that spans source time `tMs`. */
+export function splitSegmentsAt<T extends { id: string; startMs: number; endMs: number }>(
+  segs: T[],
+  tMs: number,
+  onlyId?: string,
+): T[] {
+  const minMs = MIN_CLIP_SEC * 1000;
+  return segs.flatMap((s) =>
+    (onlyId && s.id !== onlyId) || tMs - s.startMs < minMs || s.endMs - tMs < minMs
+      ? [s]
+      : [{ ...s, endMs: tMs }, { ...s, id: `${s.id}-${newClipId()}`, startMs: tMs }],
+  );
 }
 
 export function removeClip(clips: Clip[], id: string): Clip[] {
