@@ -134,3 +134,23 @@ export function moveClip(clips: Clip[], id: string, toIndex: number): Clip[] {
 export function patchClip(clips: Clip[], id: string, patch: Partial<Clip>): Clip[] {
   return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
+
+/** Map one visible piece's edit without truncating the underlying source segment. */
+export function mapSegmentPiecePatch<P extends { startMs?: number; endMs?: number }>(
+  clip: PlacedClip,
+  segment: { startMs: number; endMs: number },
+  pieceStartMs: number,
+  patch: P,
+  sourceDurationMs: number,
+): P {
+  if (patch.startMs !== undefined && patch.endMs !== undefined) {
+    const requested = (patch.startMs - pieceStartMs) * clip.speed;
+    const delta = Math.max(-segment.startMs, Math.min(sourceDurationMs - segment.endMs, requested));
+    return { ...patch, startMs: segment.startMs + delta, endMs: segment.endMs + delta };
+  }
+  return {
+    ...patch,
+    ...(patch.startMs !== undefined ? { startMs: Math.min(segment.endMs - 50, outToSrc(clip, patch.startMs / 1000) * 1000) } : {}),
+    ...(patch.endMs !== undefined ? { endMs: Math.max(segment.startMs + 50, outToSrc(clip, patch.endMs / 1000) * 1000) } : {}),
+  };
+}

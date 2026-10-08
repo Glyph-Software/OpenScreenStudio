@@ -161,7 +161,7 @@ pub(crate) struct SegmentRecorder {
     // doesn't emit a duplicate "recording-stopped-externally" event.
     stop_emitted: Arc<AtomicBool>,
     // Set once SCRecordingOutput has finished (or failed) writing the segment file.
-    finished: Arc<AtomicBool>,
+    finished: std::sync::mpsc::Receiver<Result<(), String>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -512,17 +512,17 @@ pub(crate) fn build_and_start_segment(
         stream_emit("stream.on_stop", err);
     });
 
-    let finished = Arc::new(AtomicBool::new(false));
+    let (finish_tx, finished) = std::sync::mpsc::channel();
     let rec_finish_emit = emit_external_stop.clone();
     let rec_fail_emit = emit_external_stop.clone();
-    let (finish_flag, fail_flag) = (Arc::clone(&finished), Arc::clone(&finished));
+    let fail_tx = finish_tx.clone();
     let rec_delegate = RecordingCallbacks::new()
         .on_finish(move || {
-            finish_flag.store(true, Ordering::SeqCst);
+            let _ = finish_tx.send(Ok(()));
             rec_finish_emit("recording.on_finish", None)
         })
         .on_fail(move |e| {
-            fail_flag.store(true, Ordering::SeqCst);
+            let _ = fail_tx.send(Err(format!("Recording output failed: {e:?}")));
             rec_fail_emit("recording.on_fail", Some(e))
         });
 
@@ -931,22 +931,26 @@ pub(crate) fn collect_segment(rec: &mut ActiveRecording, seg: SegmentRecorder) {
 /// Stop the active segment (if any) and push its file onto `segments`.
 /// Sets `stop_emitted` first so the SCK delegate's on_stop fires silently.
 #[cfg(target_os = "macos")]
-pub(crate) fn stop_active_segment(rec: &mut ActiveRecording) -> Result<(), String> {
+pub(crate) fn stop_active_segment(rec: &mut ActiveRecording, timeout: Duration) -> Result<(), String> {
     if let Some(seg) = rec.active.take() {
         seg.stop_emitted.store(true, Ordering::SeqCst);
         let stop_result = seg
             .stream
             .stop_capture()
             .map_err(|e| format!("stop_capture failed: {e:?}"));
-        // SCRecordingOutput writes the file asynchronously after stop; wait for its finish callback.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while !seg.finished.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // A failed stop cannot promise a delegate callback.
+        let finish_result = if stop_result.is_ok() {
+            seg.finished.recv_timeout(timeout)
+                .map_err(|e| format!("Waiting for recording finalization failed: {e}"))
+                .and_then(|result| result)
+        } else {
+            Ok(())
+        };
         // Collect even when stop failed: the taps must be finalized either
         // way or their WAVs are left with invalid headers.
         collect_segment(rec, seg);
         stop_result?;
+        finish_result?;
     }
     Ok(())
 }
@@ -1063,7 +1067,7 @@ pub(crate) fn finalize_recording(mut rec: ActiveRecording) -> Result<CaptureArti
 
     // Stop the active segment (if `stop_capture` didn't already) so every
     // segment file is on disk and finalised.
-    stop_active_segment(&mut rec)?;
+    stop_active_segment(&mut rec, Duration::from_secs(15))?;
 
     // Duration excludes paused intervals — match the concatenated MP4.
     let duration_ms = cursor_t_ms(&rec.cursor_track) as u64;
@@ -1131,7 +1135,7 @@ pub(crate) fn discard_recording(mut rec: ActiveRecording) {
     if let Some(cam) = rec.camera.take() {
         cam.discard();
     }
-    let _ = stop_active_segment(&mut rec);
+    let _ = stop_active_segment(&mut rec, Duration::from_secs(15));
     let _ = drain_cursor_track(&mut rec);
     for seg in rec
         .segments
@@ -1204,7 +1208,7 @@ pub(crate) fn pause_capture(state: State<'_, RecordingState>) -> Result<(), Stri
     if let Some(cam) = &rec.camera {
         cam.pause();
     }
-    stop_active_segment(rec)
+    stop_active_segment(rec, Duration::from_secs(2))
 }
 
 #[cfg(target_os = "macos")]
@@ -1233,30 +1237,31 @@ pub(crate) fn resume_capture(
 }
 
 #[cfg(target_os = "macos")]
-#[tauri::command]
-pub(crate) async fn cancel_capture(state: State<'_, RecordingState>) -> Result<(), String> {
+#[tauri::command(async)]
+pub(crate) fn cancel_capture(state: State<'_, RecordingState>) -> Result<(), String> {
     let rec = state
         .0
         .lock()
         .take()
         .ok_or_else(|| "No active recording.".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || discard_recording(rec))
-        .await
-        .map_err(|e| format!("Cancel capture task failed: {e}"))?;
+    discard_recording(rec);
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-#[tauri::command]
-pub(crate) async fn restart_capture(
+#[tauri::command(async)]
+pub(crate) fn restart_capture(
     app: AppHandle,
     state: State<'_, RecordingState>,
 ) -> Result<String, String> {
-    let rec = state.0.lock().take().ok_or_else(|| "No active recording.".to_string())?;
-    let prev_args = rec.args.clone();
-    tauri::async_runtime::spawn_blocking(move || discard_recording(rec))
-        .await
-        .map_err(|e| format!("Restart capture task failed: {e}"))?;
+    let prev_args = {
+        let mut guard = state.0.lock();
+        let rec = guard.take().ok_or_else(|| "No active recording.".to_string())?;
+        let args = rec.args.clone();
+        drop(guard);
+        discard_recording(rec);
+        args
+    };
     start_capture(app, prev_args, state)
 }
 
@@ -1288,13 +1293,13 @@ pub(crate) fn resume_capture(
 }
 
 #[cfg(not(target_os = "macos"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn cancel_capture(_state: State<'_, RecordingState>) -> Result<(), String> {
     Err("Screen capture is only implemented on macOS.".into())
 }
 
 #[cfg(not(target_os = "macos"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn restart_capture(
     _app: AppHandle,
     _state: State<'_, RecordingState>,
